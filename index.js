@@ -58,28 +58,58 @@ const MAX_PERSONALITY = `אתה "מקס" — מאמן חיים אישי בווי
 
 אם זו ההודעה הראשונה — התחל עם ברכה אנרגטית ושאל את השם!`;
 
+// =================== WEBHOOK VERIFICATION ===================
 app.get('/webhook', (req, res) => {
-  if (req.query['hub.verify_token'] === VERIFY_TOKEN) {
-    res.send(req.query['hub.challenge']);
+  const mode = req.query['hub.mode'];
+  const token = req.query['hub.verify_token'];
+  const challenge = req.query['hub.challenge'];
+
+  console.log('Webhook verification attempt:', { mode, token });
+
+  if (mode === 'subscribe' && token === VERIFY_TOKEN) {
+    console.log('Webhook verified successfully!');
+    res.status(200).send(challenge);
   } else {
+    console.error('Webhook verification failed. Token received:', token);
     res.sendStatus(403);
   }
 });
 
+// =================== WHATSAPP SEND ===================
 async function sendWhatsApp(userId, text) {
-  await axios.post(
-    `https://graph.facebook.com/v18.0/${PHONE_NUMBER_ID}/messages`,
-    { messaging_product: 'whatsapp', to: userId, text: { body: text } },
-    { headers: { 'Authorization': `Bearer ${WA_TOKEN}`, 'Content-Type': 'application/json' } }
-  );
+  try {
+    const response = await axios.post(
+      `https://graph.facebook.com/v21.0/${PHONE_NUMBER_ID}/messages`,
+      {
+        messaging_product: 'whatsapp',
+        recipient_type: 'individual',
+        to: userId,
+        type: 'text',
+        text: { body: text }
+      },
+      {
+        headers: {
+          'Authorization': `Bearer ${WA_TOKEN}`,
+          'Content-Type': 'application/json'
+        }
+      }
+    );
+    console.log('Message sent to', userId, '| message_id:', response.data?.messages?.[0]?.id);
+    return response.data;
+  } catch (err) {
+    console.error('sendWhatsApp error:', err.response?.data || err.message);
+    throw err;
+  }
 }
 
+// =================== DOWNLOAD IMAGE ===================
 async function downloadImage(mediaId) {
   const mediaRes = await axios.get(
-    `https://graph.facebook.com/v18.0/${mediaId}`,
+    `https://graph.facebook.com/v21.0/${mediaId}`,
     { headers: { 'Authorization': `Bearer ${WA_TOKEN}` } }
   );
-  const imageRes = await axios.get(mediaRes.data.url, {
+  const imageUrl = mediaRes.data.url;
+  const imageRes = await axios.get(imageUrl, {
     responseType: 'arraybuffer',
     headers: { 'Authorization': `Bearer ${WA_TOKEN}` }
   });
@@ -89,6 +119,7 @@ async function downloadImage(mediaId) {
   };
 }
 
+// =================== BMI CALC ===================
 function calculateBMI(height, weight) {
   const h = height / 100;
   const bmi = (weight / (h * h)).toFixed(1);
@@ -101,19 +132,21 @@ function calculateBMI(height, weight) {
   return { bmi, status, waterGoal };
 }
 
+// =================== DAILY REPORT ===================
 function generateDailyReport(meals) {
   if (!meals || meals.length === 0) return null;
   let totalCalories = 0, totalProtein = 0, totalCarbs = 0;
   let totalFat = 0, totalSugar = 0;
   const minerals = {};
   for (const meal of meals) {
-    totalCalories += meal.calories || 0;
-    totalProtein += meal.protein || 0;
-    totalCarbs += meal.carbs || 0;
-    totalFat += meal.fat || 0;
-    totalSugar += meal.sugar || 0;
-    if (meal.minerals) {
-      for (const [k, v] of Object.entries(meal.minerals)) {
+    const d = meal.data || meal;
+    totalCalories += d.calories || 0;
+    totalProtein += d.protein || 0;
+    totalCarbs += d.carbs || 0;
+    totalFat += d.fat || 0;
+    totalSugar += d.sugar || 0;
+    if (d.minerals) {
+      for (const [k, v] of Object.entries(d.minerals)) {
         minerals[k] = (minerals[k] || 0) + v;
       }
     }
@@ -121,14 +154,36 @@ function generateDailyReport(meals) {
   return { totalCalories, totalProtein, totalCarbs, totalFat, totalSugar, minerals, mealCount: meals.length };
 }
 
-// תזכורות מים כל 2 שעות למשתמשים פעילים
+// =================== ANTHROPIC CALL ===================
+async function callClaude(messages, systemPrompt, maxTokens = 1000) {
+  const body = {
+    model: 'claude-sonnet-4-20250514',
+    max_tokens: maxTokens,
+    messages
+  };
+  if (systemPrompt) body.system = systemPrompt;
+
+  const response = await axios.post(
+    'https://api.anthropic.com/v1/messages',
+    body,
+    {
+      headers: {
+        'x-api-key': ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01',
+        'content-type': 'application/json'
+      }
+    }
+  );
+  return response.data.content[0].text;
+}
+
+// =================== CRON: מים כל 2 שעות ===================
 cron.schedule('0 */2 * * *', async () => {
   const now = new Date();
   for (const [userId, user] of Object.entries(users)) {
     if (!user.lastActive) continue;
     const hoursSinceActive = (now - new Date(user.lastActive)) / (1000 * 60 * 60);
     if (hoursSinceActive > 24) continue;
-    
     const waterGoal = user.profile?.waterGoal || 2500;
     const messages = [
       `💧 היי! זמן לשתות כוס מים!\nמטרה יומית שלך: ${waterGoal}ml\nהגוף שלך מודה לך 🙏`,
@@ -136,11 +191,11 @@ cron.schedule('0 */2 * * *', async () => {
       `🌊 מקס מזכיר: שתה מים עכשיו!\n${waterGoal}ml ביום זה המטרה שלך 🎯`
     ];
     const msg = messages[Math.floor(Math.random() * messages.length)];
-    try { await sendWhatsApp(userId, msg); } catch (e) {}
+    try { await sendWhatsApp(userId, msg); } catch (e) { console.error('Water reminder error:', e.message); }
   }
 }, { timezone: 'Asia/Jerusalem' });
 
-// תזכורת שבועית לתמונת גוף — יום ראשון 9:00
+// =================== CRON: תמונת גוף שבועית ===================
 cron.schedule('0 9 * * 0', async () => {
   for (const [userId, user] of Object.entries(users)) {
     if (!user.lastActive) continue;
@@ -150,16 +205,26 @@ cron.schedule('0 9 * * 0', async () => {
       await sendWhatsApp(userId,
         `📸 היי! הגיע הזמן לתמונת ההתקדמות השבועית!\n\nשלח תמונה בלי חולצה ואני אנתח:\n💪 אחוזי שומן משוערים\n📊 השוואה לשבוע שעבר\n🎯 המלצות לשיפור\n\nזה חשוב למעקב! 🔥`
       );
-    } catch (e) {}
+    } catch (e) { console.error('Weekly photo reminder error:', e.message); }
   }
 }, { timezone: 'Asia/Jerusalem' });
 
+// =================== MAIN WEBHOOK ===================
 app.post('/webhook', async (req, res) => {
-  res.sendStatus(200);
+  res.sendStatus(200); // תמיד עונים מיד ל-Meta
 
   try {
-    const message = req.body.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
+    const entry = req.body.entry?.[0];
+    const change = entry?.changes?.[0];
+    const value = change?.value;
+
+    // התעלם מ-status updates (הודעות נשלחו/נקראו)
+    if (value?.statuses) return;
+
+    const message = value?.messages?.[0];
     if (!message) return;
+
+    console.log('Incoming message from', message.from, '| type:', message.type);
 
     const userId = message.from;
     const user = getUser(userId);
@@ -175,24 +240,19 @@ app.post('/webhook', async (req, res) => {
 
     let reply = '';
 
-    // תמונת גוף לניתוח אחוזי שומן
+    // =================== תמונת גוף ===================
     if (message.type === 'image' && user.pendingMeal === 'body_photo') {
       const { base64, mimeType } = await downloadImage(message.image.id);
       const profile = user.profile;
 
-      const bodyResponse = await axios.post(
-        'https://api.anthropic.com/v1/messages',
-        {
-          model: 'claude-sonnet-4-20250514',
-          max_tokens: 800,
-          messages: [{
-            role: 'user',
-            content: [
-              { type: 'image', source: { type: 'base64', media_type: mimeType, data: base64 } },
-              {
-                type: 'text',
-                text: `אתה מקס — מאמן כושר מומחה. נתח את הגוף בתמונה.
-נתוני המשתמש: גובה ${profile.height}cm, משקל ${profile.weight}kg, BMI ${profile.bmi}
+      reply = await callClaude([{
+        role: 'user',
+        content: [
+          { type: 'image', source: { type: 'base64', media_type: mimeType, data: base64 } },
+          {
+            type: 'text',
+            text: `אתה מקס — מאמן כושר מומחה. נתח את הגוף בתמונה.
+נתוני המשתמש: גובה ${profile.height || 'לא ידוע'}cm, משקל ${profile.weight || 'לא ידוע'}kg, BMI ${profile.bmi || 'לא חושב'}
 
 תן:
 📊 אחוזי שומן משוערים: X%
@@ -202,37 +262,22 @@ app.post('/webhook', async (req, res) => {
 💡 המלצה אחת ספציפית:
 
 היה מעודד ומקצועי!`
-              }
-            ]
-          }]
-        },
-        {
-          headers: {
-            'x-api-key': ANTHROPIC_API_KEY,
-            'anthropic-version': '2023-06-01',
-            'content-type': 'application/json'
           }
-        }
-      );
-      reply = bodyResponse.data.content[0].text;
+        ]
+      }], null, 800);
       user.pendingMeal = null;
 
+    // =================== תמונת אוכל ===================
     } else if (message.type === 'image') {
-      // תמונת אוכל
       const { base64, mimeType } = await downloadImage(message.image.id);
 
-      const imageResponse = await axios.post(
-        'https://api.anthropic.com/v1/messages',
-        {
-          model: 'claude-sonnet-4-20250514',
-          max_tokens: 1000,
-          messages: [{
-            role: 'user',
-            content: [
-              { type: 'image', source: { type: 'base64', media_type: mimeType, data: base64 } },
-              {
-                type: 'text',
-                text: `אתה מקס — מאמן תזונה מומחה. נתח את האוכל בתמונה.
+      const fullReply = await callClaude([{
+        role: 'user',
+        content: [
+          { type: 'image', source: { type: 'base64', media_type: mimeType, data: base64 } },
+          {
+            type: 'text',
+            text: `אתה מקס — מאמן תזונה מומחה. נתח את האוכל בתמונה.
 אם יש יד — השתמש בה כקנה מידה (כף יד = ~18cm).
 
 ענה בפורמט:
@@ -252,37 +297,28 @@ app.post('/webhook', async (req, res) => {
 
 💡 טיפ אחד:
 
-❓ האם הנתונים מדויקים? אם תרצה לתקן את סוג המאכל או המשקל — כתוב לי ואעדכן. אם הכל בסדר — כתוב "שמור"
+❓ האם הנתונים מדויקים? אם תרצה לתקן — כתוב לי ואעדכן. אם הכל בסדר — כתוב "שמור"
 
 DATA:{"calories":X,"protein":X,"carbs":X,"fat":X,"sugar":X,"minerals":{"iron":X,"calcium":X,"potassium":X,"magnesium":X,"sodium":X,"zinc":X,"vitC":X,"vitD":X,"vitB12":X}}`
-              }
-            ]
-          }]
-        },
-        {
-          headers: {
-            'x-api-key': ANTHROPIC_API_KEY,
-            'anthropic-version': '2023-06-01',
-            'content-type': 'application/json'
           }
-        }
-      );
+        ]
+      }], null, 1000);
 
-      const fullReply = imageResponse.data.content[0].text;
-      const dataMatch = fullReply.match(/DATA:(\{.*\})/);
-      
+      const dataMatch = fullReply.match(/DATA:(\{.*?\})/s);
       if (dataMatch) {
         try {
           user.pendingMeal = { data: JSON.parse(dataMatch[1]), time: new Date().toLocaleTimeString('he-IL') };
-        } catch (e) {}
+        } catch (e) { console.error('JSON parse error for meal data:', e.message); }
       }
 
-      reply = fullReply.replace(/DATA:\{.*\}/, '').trim();
+      reply = fullReply.replace(/DATA:\{.*?\}/s, '').trim();
 
+    // =================== טקסט ===================
     } else if (message.type === 'text') {
       const userMsg = message.text.body.trim();
+      console.log('User message:', userMsg);
 
-      // אישור שמירת ארוחה
+      // שמירת ארוחה
       if (userMsg === 'שמור' || userMsg.toLowerCase() === 'save') {
         if (user.pendingMeal && user.pendingMeal.data) {
           user.todayMeals.push(user.pendingMeal);
@@ -294,14 +330,9 @@ DATA:{"calories":X,"protein":X,"carbs":X,"fat":X,"sugar":X,"minerals":{"iron":X,
 
       // תיקון ארוחה
       } else if (user.pendingMeal && user.pendingMeal.data) {
-        const correctionResponse = await axios.post(
-          'https://api.anthropic.com/v1/messages',
-          {
-            model: 'claude-sonnet-4-20250514',
-            max_tokens: 800,
-            messages: [{
-              role: 'user',
-              content: `המשתמש רוצה לתקן את הנתונים של הארוחה.
+        const corrReply = await callClaude([{
+          role: 'user',
+          content: `המשתמש רוצה לתקן את הנתונים של הארוחה.
 הנתונים הנוכחיים: ${JSON.stringify(user.pendingMeal.data)}
 התיקון של המשתמש: "${userMsg}"
 
@@ -314,45 +345,26 @@ DATA:{"calories":X,"protein":X,"carbs":X,"fat":X,"sugar":X,"minerals":{"iron":X,
 כתוב "שמור" לאישור סופי
 
 DATA:{"calories":X,"protein":X,"carbs":X,"fat":X,"sugar":X,"minerals":{"iron":X,"calcium":X,"potassium":X,"magnesium":X,"sodium":X,"zinc":X,"vitC":X,"vitD":X,"vitB12":X}}`
-            }]
-          },
-          {
-            headers: {
-              'x-api-key': ANTHROPIC_API_KEY,
-              'anthropic-version': '2023-06-01',
-              'content-type': 'application/json'
-            }
-          }
-        );
+        }], null, 800);
 
-        const corrReply = correctionResponse.data.content[0].text;
-        const dataMatch = corrReply.match(/DATA:(\{.*\})/);
+        const dataMatch = corrReply.match(/DATA:(\{.*?\})/s);
         if (dataMatch) {
-          try {
-            user.pendingMeal.data = JSON.parse(dataMatch[1]);
-          } catch (e) {}
+          try { user.pendingMeal.data = JSON.parse(dataMatch[1]); } catch (e) {}
         }
-        reply = corrReply.replace(/DATA:\{.*\}/, '').trim();
+        reply = corrReply.replace(/DATA:\{.*?\}/s, '').trim();
 
       // דוח יומי
       } else if (userMsg.includes('דוח יומי') || userMsg.toLowerCase().includes('daily report')) {
         const report = generateDailyReport(user.todayMeals);
-        
         if (!report || report.mealCount === 0) {
           reply = `היי! 😅 עוד לא שלחת תמונות אוכל היום.\nשלח תמונה של הארוחה הבאה שלך ואתחיל לעקוב! 📸`;
         } else {
-          const waterGoal = user.profile?.waterGoal || 2500;
-          const reportResponse = await axios.post(
-            'https://api.anthropic.com/v1/messages',
-            {
-              model: 'claude-sonnet-4-20250514',
-              max_tokens: 1000,
-              messages: [{
-                role: 'user',
-                content: `אתה מקס. צור דוח יומי מפורט ומעודד:
+          reply = await callClaude([{
+            role: 'user',
+            content: `אתה מקס. צור דוח יומי מפורט ומעודד:
 
 ${report.mealCount} ארוחות | ${report.totalCalories} קק"ל | חלבון: ${report.totalProtein}g | פחמימות: ${report.totalCarbs}g | שומן: ${report.totalFat}g | סוכר: ${report.totalSugar}g
-מטרת מים: ${waterGoal}ml
+מטרת מים: ${user.profile?.waterGoal || 2500}ml
 מינרלים: ${Object.entries(report.minerals).map(([k,v]) => `${k}: ${v}`).join(', ')}
 
 תן:
@@ -363,17 +375,7 @@ ${report.mealCount} ארוחות | ${report.totalCalories} קק"ל | חלבון:
 5. ציון יומי מ-10
 
 קצר, ישיר, עם אמוג'י, מעודד!`
-              }]
-            },
-            {
-              headers: {
-                'x-api-key': ANTHROPIC_API_KEY,
-                'anthropic-version': '2023-06-01',
-                'content-type': 'application/json'
-              }
-            }
-          );
-          reply = reportResponse.data.content[0].text;
+          }], null, 1000);
         }
 
       // תמונת גוף
@@ -381,32 +383,17 @@ ${report.mealCount} ארוחות | ${report.totalCalories} קק"ל | חלבון:
         user.pendingMeal = 'body_photo';
         reply = `💪 מעולה! שלח תמונה בלי חולצה ואנתח לך:\n- אחוזי שומן משוערים\n- סוג גוף\n- המלצות אישיות\n\nוודא שהתמונה ברורה ובאור טוב 📸`;
 
+      // שיחה רגילה
       } else {
-        // שיחה רגילה
         user.history.push({ role: 'user', content: userMsg });
         if (user.history.length > 30) user.history = user.history.slice(-30);
 
-        const response = await axios.post(
-          'https://api.anthropic.com/v1/messages',
-          {
-            model: 'claude-sonnet-4-20250514',
-            max_tokens: 1000,
-            system: MAX_PERSONALITY + `\n\n📊 מצב המשתמש:\n- רצף ימים: ${user.streak}\n- יום היכרות: ${user.onboardingDay}\n- גובה: ${user.profile.height || 'לא ידוע'} | משקל: ${user.profile.weight || 'לא ידוע'} | BMI: ${user.profile.bmi || 'לא חושב'}\n- מטרת מים: ${user.profile.waterGoal || 'לא חושבה'}ml\n- ארוחות היום: ${user.todayMeals.length}`,
-            messages: user.history
-          },
-          {
-            headers: {
-              'x-api-key': ANTHROPIC_API_KEY,
-              'anthropic-version': '2023-06-01',
-              'content-type': 'application/json'
-            }
-          }
-        );
+        const systemWithState = MAX_PERSONALITY + `\n\n📊 מצב המשתמש:\n- רצף ימים: ${user.streak}\n- יום היכרות: ${user.onboardingDay}\n- גובה: ${user.profile.height || 'לא ידוע'} | משקל: ${user.profile.weight || 'לא ידוע'} | BMI: ${user.profile.bmi || 'לא חושב'}\n- מטרת מים: ${user.profile.waterGoal || 'לא חושבה'}ml\n- ארוחות היום: ${user.todayMeals.length}`;
 
-        let aiReply = response.data.content[0].text;
+        let aiReply = await callClaude(user.history, systemWithState, 1000);
 
-        // שמירת BMI אם מקס קיבל נתונים
-        const bmiMatch = aiReply.match(/\[SAVE_BMI:(\d+):(\d+(?:\.\d+)?)\]/);
+        // שמירת BMI
+        const bmiMatch = aiReply.match(/\[SAVE_BMI:(\d+(?:\.\d+)?):(\d+(?:\.\d+)?)\]/);
         if (bmiMatch) {
           const height = parseFloat(bmiMatch[1]);
           const weight = parseFloat(bmiMatch[2]);
@@ -417,6 +404,7 @@ ${report.mealCount} ארוחות | ${report.totalCalories} קק"ל | חלבון:
           user.profile.waterGoal = waterGoal;
           aiReply = aiReply.replace(bmiMatch[0], '').trim();
           aiReply += `\n\n📊 BMI שלך: ${bmi} (${status})\n💧 מטרת מים יומית: ${waterGoal}ml`;
+          console.log('BMI saved for', userId, ':', bmi);
         }
 
         reply = aiReply;
@@ -426,13 +414,25 @@ ${report.mealCount} ארוחות | ${report.totalCalories} קק"ל | חלבון:
           user.onboardingDay = Math.min(3, Math.floor(user.history.length / 6) + 1);
         }
       }
+
+    } else {
+      console.log('Unsupported message type:', message.type);
+      reply = `סוג הודעה זה עדיין לא נתמך 😅 שלח טקסט או תמונה!`;
     }
 
     if (reply) await sendWhatsApp(userId, reply);
 
   } catch (err) {
-    console.error(err.response?.data || err.message);
+    console.error('Webhook handler error:', err.response?.data || err.message);
   }
 });
 
-app.listen(process.env.PORT || 3000, () => console.log('מקס פועל! 🚀'));
+// Health check
+app.get('/', (req, res) => res.send('מקס פועל! 🚀'));
+
+app.listen(process.env.PORT || 3000, () => {
+  console.log('🚀 מקס פועל על פורט', process.env.PORT || 3000);
+  console.log('PHONE_NUMBER_ID:', PHONE_NUMBER_ID);
+  console.log('WA_TOKEN set:', !!WA_TOKEN);
+  console.log('ANTHROPIC_API_KEY set:', !!ANTHROPIC_API_KEY);
+});
