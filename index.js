@@ -17,7 +17,9 @@ function getUser(userId) {
       history: [],
       onboardingDay: 1,
       streak: 0,
-      lastCheckIn: null
+      lastCheckIn: null,
+      todayMeals: [],
+      lastMealReport: null
     };
   }
   return users[userId];
@@ -42,12 +44,6 @@ const MAX_PERSONALITY = `אתה "מקס" — מאמן חיים אישי בווי
 - חיזוקים חיוביים: כשמשתמש מדווח על הצלחה — חגוג את זה בגדול!
 - ציפייה: "מחר אני רוצה לשמוע איך היה האימון"
 
-🥗 מעקב תזונה:
-אם המשתמש שולח תמונת אוכל — נתח אותה והגב עם:
-1. הערכת קלוריות גסה
-2. חלבון/פחמימות/שומן
-3. טיפ אחד לשיפור
-
 💪 סגנון תקשורת:
 - הודעות קצרות וחדות (לא יותר מ-5 שורות)
 - הרבה אמוג'י
@@ -67,17 +63,8 @@ app.get('/webhook', (req, res) => {
 async function sendWhatsApp(userId, text) {
   await axios.post(
     `https://graph.facebook.com/v18.0/${PHONE_NUMBER_ID}/messages`,
-    {
-      messaging_product: 'whatsapp',
-      to: userId,
-      text: { body: text }
-    },
-    {
-      headers: {
-        'Authorization': `Bearer ${WA_TOKEN}`,
-        'Content-Type': 'application/json'
-      }
-    }
+    { messaging_product: 'whatsapp', to: userId, text: { body: text } },
+    { headers: { 'Authorization': `Bearer ${WA_TOKEN}`, 'Content-Type': 'application/json' } }
   );
 }
 
@@ -96,6 +83,29 @@ async function downloadImage(mediaId) {
   };
 }
 
+function generateDailyReport(meals) {
+  if (!meals || meals.length === 0) return null;
+  
+  let totalCalories = 0, totalProtein = 0, totalCarbs = 0;
+  let totalFat = 0, totalSugar = 0;
+  const minerals = {};
+  
+  for (const meal of meals) {
+    totalCalories += meal.calories || 0;
+    totalProtein += meal.protein || 0;
+    totalCarbs += meal.carbs || 0;
+    totalFat += meal.fat || 0;
+    totalSugar += meal.sugar || 0;
+    if (meal.minerals) {
+      for (const [k, v] of Object.entries(meal.minerals)) {
+        minerals[k] = (minerals[k] || 0) + v;
+      }
+    }
+  }
+  
+  return { totalCalories, totalProtein, totalCarbs, totalFat, totalSugar, minerals, mealCount: meals.length };
+}
+
 app.post('/webhook', async (req, res) => {
   res.sendStatus(200);
 
@@ -110,6 +120,7 @@ app.post('/webhook', async (req, res) => {
     if (user.lastCheckIn !== today) {
       user.streak += 1;
       user.lastCheckIn = today;
+      user.todayMeals = [];
     }
 
     let reply = '';
@@ -121,23 +132,43 @@ app.post('/webhook', async (req, res) => {
         'https://api.anthropic.com/v1/messages',
         {
           model: 'claude-sonnet-4-20250514',
-          max_tokens: 500,
+          max_tokens: 1000,
           messages: [{
             role: 'user',
             content: [
-              {
-                type: 'image',
-                source: { type: 'base64', media_type: mimeType, data: base64 }
-              },
+              { type: 'image', source: { type: 'base64', media_type: mimeType, data: base64 } },
               {
                 type: 'text',
-                text: `אתה מקס — מאמן תזונה חוצפן ונחמד. נתח את האוכל בתמונה:
-🔥 קלוריות: (הערכה)
+                text: `אתה מקס — מאמן תזונה מומחה. נתח את האוכל בתמונה בצורה מדויקת.
+
+אם יש יד בתמונה — השתמש בה כקנה מידה (כף יד ממוצעת = כ-18 ס"מ).
+אם אין יד — הערך לפי הצלחת/כלי ואמור שההערכה פחות מדויקת.
+
+ענה בפורמט הזה בדיוק:
+🍽️ מה אני רואה: [תאר את האוכל]
+📏 קנה מידה: [האם יש יד? כמה גדולה המנה לפי הערכה?]
+
+🔥 קלוריות: ~X קק"ל
 💪 חלבון: Xg
 🍞 פחמימות: Xg
+🍬 סוכרים: Xg
 🥑 שומן: Xg
-💡 טיפ אחד לשיפור
-קצר, ישיר, עם אמוג'י!`
+
+🧂 מינרלים עיקריים:
+• ברזל: Xmg
+• סידן: Xmg
+• אשלגן: Xmg
+• מגנזיום: Xmg
+• נתרן: Xmg
+• אבץ: Xmg
+• ויטמין C: Xmg
+• ויטמין D: Xμg
+• ויטמין B12: Xμg
+
+💡 טיפ אחד לשיפור:
+
+ואז תן JSON בשורה אחת בדיוק כך (לצורך מעקב):
+DATA:{"calories":X,"protein":X,"carbs":X,"fat":X,"sugar":X,"minerals":{"iron":X,"calcium":X,"potassium":X,"magnesium":X,"sodium":X,"zinc":X,"vitC":X,"vitD":X,"vitB12":X}}`
               }
             ]
           }]
@@ -150,35 +181,94 @@ app.post('/webhook', async (req, res) => {
           }
         }
       );
-      reply = imageResponse.data.content[0].text;
+
+      const fullReply = imageResponse.data.content[0].text;
+      
+      // שמירת נתוני הארוחה
+      const dataMatch = fullReply.match(/DATA:(\{.*\})/);
+      if (dataMatch) {
+        try {
+          const mealData = JSON.parse(dataMatch[1]);
+          user.todayMeals.push({ ...mealData, time: new Date().toLocaleTimeString('he-IL') });
+        } catch (e) {}
+      }
+      
+      // הסרת שורת ה-DATA מהתגובה
+      reply = fullReply.replace(/DATA:\{.*\}/, '').trim();
+      reply += `\n\n📊 סה"כ היום: ${user.todayMeals.length} ארוחות | שלח "דוח יומי" לסיכום מלא`;
 
     } else if (message.type === 'text') {
       const userMsg = message.text.body;
-      user.history.push({ role: 'user', content: userMsg });
-      if (user.history.length > 30) user.history = user.history.slice(-30);
 
-      const response = await axios.post(
-        'https://api.anthropic.com/v1/messages',
-        {
-          model: 'claude-sonnet-4-20250514',
-          max_tokens: 1000,
-          system: MAX_PERSONALITY + `\n\n📊 מצב המשתמש הנוכחי:\n- רצף ימים: ${user.streak}\n- יום היכרות: ${user.onboardingDay}\n- פרופיל: עדיין לא מלא`,
-          messages: user.history
-        },
-        {
-          headers: {
-            'x-api-key': ANTHROPIC_API_KEY,
-            'anthropic-version': '2023-06-01',
-            'content-type': 'application/json'
-          }
+      // בקשת דוח יומי
+      if (userMsg.includes('דוח יומי') || userMsg.toLowerCase().includes('daily report')) {
+        const report = generateDailyReport(user.todayMeals);
+        
+        if (!report || report.mealCount === 0) {
+          reply = `היי! 😅 עוד לא שלחת תמונות אוכל היום.\nשלח תמונה של הארוחה הבאה שלך ואתחיל לעקוב! 📸`;
+        } else {
+          const reportResponse = await axios.post(
+            'https://api.anthropic.com/v1/messages',
+            {
+              model: 'claude-sonnet-4-20250514',
+              max_tokens: 1000,
+              messages: [{
+                role: 'user',
+                content: `אתה מקס — מאמן תזונה. צור דוח יומי מפורט ומעודד על בסיס הנתונים הבאים:
+
+${report.mealCount} ארוחות היום
+סה"כ: ${report.totalCalories} קק"ל | חלבון: ${report.totalProtein}g | פחמימות: ${report.totalCarbs}g | שומן: ${report.totalFat}g | סוכר: ${report.totalSugar}g
+
+מינרלים:
+${Object.entries(report.minerals).map(([k,v]) => `${k}: ${v}`).join(', ')}
+
+תן:
+1. סיכום קצר של היום
+2. מה היה טוב
+3. מה חסר (איזה מינרלים/ויטמינים)
+4. המלצה על 2-3 מאכלים ספציפיים להשלמת החסר
+
+סגנון: קצר, ישיר, עם אמוג'י, מעודד!`
+              }]
+            },
+            {
+              headers: {
+                'x-api-key': ANTHROPIC_API_KEY,
+                'anthropic-version': '2023-06-01',
+                'content-type': 'application/json'
+              }
+            }
+          );
+          reply = reportResponse.data.content[0].text;
         }
-      );
+      } else {
+        // שיחה רגילה
+        user.history.push({ role: 'user', content: userMsg });
+        if (user.history.length > 30) user.history = user.history.slice(-30);
 
-      reply = response.data.content[0].text;
-      user.history.push({ role: 'assistant', content: reply });
+        const response = await axios.post(
+          'https://api.anthropic.com/v1/messages',
+          {
+            model: 'claude-sonnet-4-20250514',
+            max_tokens: 1000,
+            system: MAX_PERSONALITY + `\n\n📊 מצב המשתמש הנוכחי:\n- רצף ימים: ${user.streak}\n- יום היכרות: ${user.onboardingDay}\n- ארוחות היום: ${user.todayMeals.length}`,
+            messages: user.history
+          },
+          {
+            headers: {
+              'x-api-key': ANTHROPIC_API_KEY,
+              'anthropic-version': '2023-06-01',
+              'content-type': 'application/json'
+            }
+          }
+        );
 
-      if (user.onboardingDay < 3 && user.history.length > 6) {
-        user.onboardingDay = Math.min(3, Math.floor(user.history.length / 6) + 1);
+        reply = response.data.content[0].text;
+        user.history.push({ role: 'assistant', content: reply });
+
+        if (user.onboardingDay < 3 && user.history.length > 6) {
+          user.onboardingDay = Math.min(3, Math.floor(user.history.length / 6) + 1);
+        }
       }
     }
 
