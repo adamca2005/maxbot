@@ -1,5 +1,6 @@
 const express = require('express');
 const axios = require('axios');
+const cron = require('node-cron');
 
 const app = express();
 app.use(express.json());
@@ -19,7 +20,10 @@ function getUser(userId) {
       streak: 0,
       lastCheckIn: null,
       todayMeals: [],
-      lastMealReport: null
+      pendingMeal: null,
+      profile: { height: null, weight: null, bmi: null, waterGoal: null },
+      lastActive: null,
+      waterReminders: 0
     };
   }
   return users[userId];
@@ -33,9 +37,11 @@ const MAX_PERSONALITY = `אתה "מקס" — מאמן חיים אישי בווי
 - להשתמש בעקרונות ביוהאקינג מדעיים
 
 📋 תהליך היכרות (3 ימים ראשונים):
-יום 1 - שאל על: שם, גיל, מטרות עיקריות (3 מטרות), שגרת יום טיפוסית
+יום 1 - שאל על: שם, גיל, מטרות עיקריות (3 מטרות), שגרת יום טיפוסית, גובה ומשקל
 יום 2 - שאל על: תזונה נוכחית, שעות שינה, רמת פעילות גופנית, עבודה/לחץ
 יום 3 - שאל על: מה ניסו בעבר ולא עבד, מה המכשולים הגדולים, כמה זמן יש ביום לשינוי
+
+כשמשתמש נותן גובה ומשקל — כתוב [SAVE_BMI:גובה:משקל] בתחילת התגובה.
 
 🧠 טכניקות מוטיבציה שאתה משתמש בהן:
 - רצף ימים (streak): "אתה על רצף של X ימים — אל תשבור אותו!"
@@ -83,13 +89,23 @@ async function downloadImage(mediaId) {
   };
 }
 
+function calculateBMI(height, weight) {
+  const h = height / 100;
+  const bmi = (weight / (h * h)).toFixed(1);
+  let status = '';
+  if (bmi < 18.5) status = 'תת משקל';
+  else if (bmi < 25) status = 'משקל תקין ✅';
+  else if (bmi < 30) status = 'עודף משקל';
+  else status = 'השמנה';
+  const waterGoal = Math.round(weight * 35);
+  return { bmi, status, waterGoal };
+}
+
 function generateDailyReport(meals) {
   if (!meals || meals.length === 0) return null;
-  
   let totalCalories = 0, totalProtein = 0, totalCarbs = 0;
   let totalFat = 0, totalSugar = 0;
   const minerals = {};
-  
   for (const meal of meals) {
     totalCalories += meal.calories || 0;
     totalProtein += meal.protein || 0;
@@ -102,9 +118,41 @@ function generateDailyReport(meals) {
       }
     }
   }
-  
   return { totalCalories, totalProtein, totalCarbs, totalFat, totalSugar, minerals, mealCount: meals.length };
 }
+
+// תזכורות מים כל 2 שעות למשתמשים פעילים
+cron.schedule('0 */2 * * *', async () => {
+  const now = new Date();
+  for (const [userId, user] of Object.entries(users)) {
+    if (!user.lastActive) continue;
+    const hoursSinceActive = (now - new Date(user.lastActive)) / (1000 * 60 * 60);
+    if (hoursSinceActive > 24) continue;
+    
+    const waterGoal = user.profile?.waterGoal || 2500;
+    const messages = [
+      `💧 היי! זמן לשתות כוס מים!\nמטרה יומית שלך: ${waterGoal}ml\nהגוף שלך מודה לך 🙏`,
+      `💦 תזכורת מים! אל תשכח לשתות 💪\nמים = אנרגיה = ביצועים טובים יותר!`,
+      `🌊 מקס מזכיר: שתה מים עכשיו!\n${waterGoal}ml ביום זה המטרה שלך 🎯`
+    ];
+    const msg = messages[Math.floor(Math.random() * messages.length)];
+    try { await sendWhatsApp(userId, msg); } catch (e) {}
+  }
+}, { timezone: 'Asia/Jerusalem' });
+
+// תזכורת שבועית לתמונת גוף — יום ראשון 9:00
+cron.schedule('0 9 * * 0', async () => {
+  for (const [userId, user] of Object.entries(users)) {
+    if (!user.lastActive) continue;
+    const hoursSinceActive = (new Date() - new Date(user.lastActive)) / (1000 * 60 * 60);
+    if (hoursSinceActive > 48) continue;
+    try {
+      await sendWhatsApp(userId,
+        `📸 היי! הגיע הזמן לתמונת ההתקדמות השבועית!\n\nשלח תמונה בלי חולצה ואני אנתח:\n💪 אחוזי שומן משוערים\n📊 השוואה לשבוע שעבר\n🎯 המלצות לשיפור\n\nזה חשוב למעקב! 🔥`
+      );
+    } catch (e) {}
+  }
+}, { timezone: 'Asia/Jerusalem' });
 
 app.post('/webhook', async (req, res) => {
   res.sendStatus(200);
@@ -115,17 +163,62 @@ app.post('/webhook', async (req, res) => {
 
     const userId = message.from;
     const user = getUser(userId);
+    user.lastActive = new Date();
 
     const today = new Date().toDateString();
     if (user.lastCheckIn !== today) {
       user.streak += 1;
       user.lastCheckIn = today;
       user.todayMeals = [];
+      user.waterReminders = 0;
     }
 
     let reply = '';
 
-    if (message.type === 'image') {
+    // תמונת גוף לניתוח אחוזי שומן
+    if (message.type === 'image' && user.pendingMeal === 'body_photo') {
+      const { base64, mimeType } = await downloadImage(message.image.id);
+      const profile = user.profile;
+
+      const bodyResponse = await axios.post(
+        'https://api.anthropic.com/v1/messages',
+        {
+          model: 'claude-sonnet-4-20250514',
+          max_tokens: 800,
+          messages: [{
+            role: 'user',
+            content: [
+              { type: 'image', source: { type: 'base64', media_type: mimeType, data: base64 } },
+              {
+                type: 'text',
+                text: `אתה מקס — מאמן כושר מומחה. נתח את הגוף בתמונה.
+נתוני המשתמש: גובה ${profile.height}cm, משקל ${profile.weight}kg, BMI ${profile.bmi}
+
+תן:
+📊 אחוזי שומן משוערים: X%
+💪 סוג גוף: (אקטומורף/מזומורף/אנדומורף)
+🎯 אזורים לשיפור: 
+✅ מה נראה טוב:
+💡 המלצה אחת ספציפית:
+
+היה מעודד ומקצועי!`
+              }
+            ]
+          }]
+        },
+        {
+          headers: {
+            'x-api-key': ANTHROPIC_API_KEY,
+            'anthropic-version': '2023-06-01',
+            'content-type': 'application/json'
+          }
+        }
+      );
+      reply = bodyResponse.data.content[0].text;
+      user.pendingMeal = null;
+
+    } else if (message.type === 'image') {
+      // תמונת אוכל
       const { base64, mimeType } = await downloadImage(message.image.id);
 
       const imageResponse = await axios.post(
@@ -139,14 +232,12 @@ app.post('/webhook', async (req, res) => {
               { type: 'image', source: { type: 'base64', media_type: mimeType, data: base64 } },
               {
                 type: 'text',
-                text: `אתה מקס — מאמן תזונה מומחה. נתח את האוכל בתמונה בצורה מדויקת.
+                text: `אתה מקס — מאמן תזונה מומחה. נתח את האוכל בתמונה.
+אם יש יד — השתמש בה כקנה מידה (כף יד = ~18cm).
 
-אם יש יד בתמונה — השתמש בה כקנה מידה (כף יד ממוצעת = כ-18 ס"מ).
-אם אין יד — הערך לפי הצלחת/כלי ואמור שההערכה פחות מדויקת.
-
-ענה בפורמט הזה בדיוק:
-🍽️ מה אני רואה: [תאר את האוכל]
-📏 קנה מידה: [האם יש יד? כמה גדולה המנה לפי הערכה?]
+ענה בפורמט:
+🍽️ מה אני רואה: [תאר]
+📏 קנה מידה: [האם יש יד? גודל מנה?]
 
 🔥 קלוריות: ~X קק"ל
 💪 חלבון: Xg
@@ -154,20 +245,15 @@ app.post('/webhook', async (req, res) => {
 🍬 סוכרים: Xg
 🥑 שומן: Xg
 
-🧂 מינרלים עיקריים:
-• ברזל: Xmg
-• סידן: Xmg
-• אשלגן: Xmg
-• מגנזיום: Xmg
-• נתרן: Xmg
-• אבץ: Xmg
-• ויטמין C: Xmg
-• ויטמין D: Xμg
-• ויטמין B12: Xμg
+🧂 מינרלים:
+• ברזל: Xmg | סידן: Xmg | אשלגן: Xmg
+• מגנזיום: Xmg | נתרן: Xmg | אבץ: Xmg
+• ויטמין C: Xmg | ויטמין D: Xμg | B12: Xμg
 
-💡 טיפ אחד לשיפור:
+💡 טיפ אחד:
 
-ואז תן JSON בשורה אחת בדיוק כך (לצורך מעקב):
+❓ האם הנתונים מדויקים? אם תרצה לתקן את סוג המאכל או המשקל — כתוב לי ואעדכן. אם הכל בסדר — כתוב "שמור"
+
 DATA:{"calories":X,"protein":X,"carbs":X,"fat":X,"sugar":X,"minerals":{"iron":X,"calcium":X,"potassium":X,"magnesium":X,"sodium":X,"zinc":X,"vitC":X,"vitD":X,"vitB12":X}}`
               }
             ]
@@ -183,30 +269,79 @@ DATA:{"calories":X,"protein":X,"carbs":X,"fat":X,"sugar":X,"minerals":{"iron":X,
       );
 
       const fullReply = imageResponse.data.content[0].text;
-      
-      // שמירת נתוני הארוחה
       const dataMatch = fullReply.match(/DATA:(\{.*\})/);
+      
       if (dataMatch) {
         try {
-          const mealData = JSON.parse(dataMatch[1]);
-          user.todayMeals.push({ ...mealData, time: new Date().toLocaleTimeString('he-IL') });
+          user.pendingMeal = { data: JSON.parse(dataMatch[1]), time: new Date().toLocaleTimeString('he-IL') };
         } catch (e) {}
       }
-      
-      // הסרת שורת ה-DATA מהתגובה
+
       reply = fullReply.replace(/DATA:\{.*\}/, '').trim();
-      reply += `\n\n📊 סה"כ היום: ${user.todayMeals.length} ארוחות | שלח "דוח יומי" לסיכום מלא`;
 
     } else if (message.type === 'text') {
-      const userMsg = message.text.body;
+      const userMsg = message.text.body.trim();
 
-      // בקשת דוח יומי
-      if (userMsg.includes('דוח יומי') || userMsg.toLowerCase().includes('daily report')) {
+      // אישור שמירת ארוחה
+      if (userMsg === 'שמור' || userMsg.toLowerCase() === 'save') {
+        if (user.pendingMeal && user.pendingMeal.data) {
+          user.todayMeals.push(user.pendingMeal);
+          user.pendingMeal = null;
+          reply = `✅ נשמר! ${user.todayMeals.length} ארוחות מתועדות היום.\nשלח "דוח יומי" לסיכום 📊`;
+        } else {
+          reply = `אין ארוחה ממתינה לשמירה 😅`;
+        }
+
+      // תיקון ארוחה
+      } else if (user.pendingMeal && user.pendingMeal.data) {
+        const correctionResponse = await axios.post(
+          'https://api.anthropic.com/v1/messages',
+          {
+            model: 'claude-sonnet-4-20250514',
+            max_tokens: 800,
+            messages: [{
+              role: 'user',
+              content: `המשתמש רוצה לתקן את הנתונים של הארוחה.
+הנתונים הנוכחיים: ${JSON.stringify(user.pendingMeal.data)}
+התיקון של המשתמש: "${userMsg}"
+
+עדכן את הנתונים לפי התיקון ותן תשובה בפורמט:
+✏️ עדכנתי לפי המידע שלך:
+🔥 קלוריות: ~X קק"ל
+💪 חלבון: Xg | 🍞 פחמימות: Xg | 🍬 סוכרים: Xg | 🥑 שומן: Xg
+🧂 מינרלים: [עיקריים]
+
+כתוב "שמור" לאישור סופי
+
+DATA:{"calories":X,"protein":X,"carbs":X,"fat":X,"sugar":X,"minerals":{"iron":X,"calcium":X,"potassium":X,"magnesium":X,"sodium":X,"zinc":X,"vitC":X,"vitD":X,"vitB12":X}}`
+            }]
+          },
+          {
+            headers: {
+              'x-api-key': ANTHROPIC_API_KEY,
+              'anthropic-version': '2023-06-01',
+              'content-type': 'application/json'
+            }
+          }
+        );
+
+        const corrReply = correctionResponse.data.content[0].text;
+        const dataMatch = corrReply.match(/DATA:(\{.*\})/);
+        if (dataMatch) {
+          try {
+            user.pendingMeal.data = JSON.parse(dataMatch[1]);
+          } catch (e) {}
+        }
+        reply = corrReply.replace(/DATA:\{.*\}/, '').trim();
+
+      // דוח יומי
+      } else if (userMsg.includes('דוח יומי') || userMsg.toLowerCase().includes('daily report')) {
         const report = generateDailyReport(user.todayMeals);
         
         if (!report || report.mealCount === 0) {
           reply = `היי! 😅 עוד לא שלחת תמונות אוכל היום.\nשלח תמונה של הארוחה הבאה שלך ואתחיל לעקוב! 📸`;
         } else {
+          const waterGoal = user.profile?.waterGoal || 2500;
           const reportResponse = await axios.post(
             'https://api.anthropic.com/v1/messages',
             {
@@ -214,21 +349,20 @@ DATA:{"calories":X,"protein":X,"carbs":X,"fat":X,"sugar":X,"minerals":{"iron":X,
               max_tokens: 1000,
               messages: [{
                 role: 'user',
-                content: `אתה מקס — מאמן תזונה. צור דוח יומי מפורט ומעודד על בסיס הנתונים הבאים:
+                content: `אתה מקס. צור דוח יומי מפורט ומעודד:
 
-${report.mealCount} ארוחות היום
-סה"כ: ${report.totalCalories} קק"ל | חלבון: ${report.totalProtein}g | פחמימות: ${report.totalCarbs}g | שומן: ${report.totalFat}g | סוכר: ${report.totalSugar}g
-
-מינרלים:
-${Object.entries(report.minerals).map(([k,v]) => `${k}: ${v}`).join(', ')}
+${report.mealCount} ארוחות | ${report.totalCalories} קק"ל | חלבון: ${report.totalProtein}g | פחמימות: ${report.totalCarbs}g | שומן: ${report.totalFat}g | סוכר: ${report.totalSugar}g
+מטרת מים: ${waterGoal}ml
+מינרלים: ${Object.entries(report.minerals).map(([k,v]) => `${k}: ${v}`).join(', ')}
 
 תן:
 1. סיכום קצר של היום
 2. מה היה טוב
-3. מה חסר (איזה מינרלים/ויטמינים)
-4. המלצה על 2-3 מאכלים ספציפיים להשלמת החסר
+3. מה חסר (מינרלים/ויטמינים)
+4. המלצה על 2-3 מאכלים להשלמת החסר
+5. ציון יומי מ-10
 
-סגנון: קצר, ישיר, עם אמוג'י, מעודד!`
+קצר, ישיר, עם אמוג'י, מעודד!`
               }]
             },
             {
@@ -241,6 +375,12 @@ ${Object.entries(report.minerals).map(([k,v]) => `${k}: ${v}`).join(', ')}
           );
           reply = reportResponse.data.content[0].text;
         }
+
+      // תמונת גוף
+      } else if (userMsg.includes('תמונת גוף') || userMsg.includes('אחוזי שומן')) {
+        user.pendingMeal = 'body_photo';
+        reply = `💪 מעולה! שלח תמונה בלי חולצה ואנתח לך:\n- אחוזי שומן משוערים\n- סוג גוף\n- המלצות אישיות\n\nוודא שהתמונה ברורה ובאור טוב 📸`;
+
       } else {
         // שיחה רגילה
         user.history.push({ role: 'user', content: userMsg });
@@ -251,7 +391,7 @@ ${Object.entries(report.minerals).map(([k,v]) => `${k}: ${v}`).join(', ')}
           {
             model: 'claude-sonnet-4-20250514',
             max_tokens: 1000,
-            system: MAX_PERSONALITY + `\n\n📊 מצב המשתמש הנוכחי:\n- רצף ימים: ${user.streak}\n- יום היכרות: ${user.onboardingDay}\n- ארוחות היום: ${user.todayMeals.length}`,
+            system: MAX_PERSONALITY + `\n\n📊 מצב המשתמש:\n- רצף ימים: ${user.streak}\n- יום היכרות: ${user.onboardingDay}\n- גובה: ${user.profile.height || 'לא ידוע'} | משקל: ${user.profile.weight || 'לא ידוע'} | BMI: ${user.profile.bmi || 'לא חושב'}\n- מטרת מים: ${user.profile.waterGoal || 'לא חושבה'}ml\n- ארוחות היום: ${user.todayMeals.length}`,
             messages: user.history
           },
           {
@@ -263,7 +403,23 @@ ${Object.entries(report.minerals).map(([k,v]) => `${k}: ${v}`).join(', ')}
           }
         );
 
-        reply = response.data.content[0].text;
+        let aiReply = response.data.content[0].text;
+
+        // שמירת BMI אם מקס קיבל נתונים
+        const bmiMatch = aiReply.match(/\[SAVE_BMI:(\d+):(\d+(?:\.\d+)?)\]/);
+        if (bmiMatch) {
+          const height = parseFloat(bmiMatch[1]);
+          const weight = parseFloat(bmiMatch[2]);
+          const { bmi, status, waterGoal } = calculateBMI(height, weight);
+          user.profile.height = height;
+          user.profile.weight = weight;
+          user.profile.bmi = bmi;
+          user.profile.waterGoal = waterGoal;
+          aiReply = aiReply.replace(bmiMatch[0], '').trim();
+          aiReply += `\n\n📊 BMI שלך: ${bmi} (${status})\n💧 מטרת מים יומית: ${waterGoal}ml`;
+        }
+
+        reply = aiReply;
         user.history.push({ role: 'assistant', content: reply });
 
         if (user.onboardingDay < 3 && user.history.length > 6) {
