@@ -11,6 +11,18 @@ const VERIFY_TOKEN = 'maxbot123';
 
 const users = {};
 
+function getUser(userId) {
+  if (!users[userId]) {
+    users[userId] = {
+      history: [],
+      onboardingDay: 1,
+      streak: 0,
+      lastCheckIn: null
+    };
+  }
+  return users[userId];
+}
+
 app.get('/webhook', (req, res) => {
   if (req.query['hub.verify_token'] === VERIFY_TOKEN) {
     res.send(req.query['hub.challenge']);
@@ -21,28 +33,62 @@ app.get('/webhook', (req, res) => {
 
 app.post('/webhook', async (req, res) => {
   res.sendStatus(200);
-  
+
   try {
-    const entry = req.body.entry?.[0];
-    const change = entry?.changes?.[0];
-    const message = change?.value?.messages?.[0];
-    
+    const message = req.body.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
     if (!message || message.type !== 'text') return;
-    
+
     const userId = message.from;
     const userMsg = message.text.body;
-    
-    if (!users[userId]) users[userId] = [];
-    users[userId].push({ role: 'user', content: userMsg });
-    if (users[userId].length > 20) users[userId] = users[userId].slice(-20);
-    
+    const user = getUser(userId);
+
+    const today = new Date().toDateString();
+    if (user.lastCheckIn !== today) {
+      user.streak += 1;
+      user.lastCheckIn = today;
+    }
+
+    user.history.push({ role: 'user', content: userMsg });
+    if (user.history.length > 30) user.history = user.history.slice(-30);
+
     const response = await axios.post(
       'https://api.anthropic.com/v1/messages',
       {
         model: 'claude-sonnet-4-20250514',
-        max_tokens: 500,
-        system: 'אתה מקס — מאמן חיים אישי. חוצפן, ישיר, מצחיק, מלא אנרגיה. עוזר עם תזונה, כושר, שינה וביוהאקינג. הודעות קצרות, הרבה אמוג\'י, שאלה אחת בסוף.',
-        messages: users[userId]
+        max_tokens: 1000,
+        system: `אתה "מקס" — מאמן חיים אישי בוויצאפ. אתה חוצפן, ישיר, מצחיק, ומלא אנרגיה. אתה מדבר בעברית או אנגלית לפי מה שהמשתמש כותב.
+
+🎯 המשימה שלך:
+- לעזור לאנשים להגיע לפוטנציאל המקסימלי שלהם
+- לשפר תזונה, כושר, שינה ואיכות חיים כללית
+- להשתמש בעקרונות ביוהאקינג מדעיים
+
+📋 תהליך היכרות (3 ימים ראשונים):
+יום 1 - שאל על: שם, גיל, מטרות עיקריות (3 מטרות), שגרת יום טיפוסית
+יום 2 - שאל על: תזונה נוכחית, שעות שינה, רמת פעילות גופנית, עבודה/לחץ
+יום 3 - שאל על: מה ניסו בעבר ולא עבד, מה המכשולים הגדולים, כמה זמן יש ביום לשינוי
+
+🧠 טכניקות מוטיבציה:
+- רצף ימים: "אתה על רצף של X ימים — אל תשבור אותו!"
+- השוואה לעצמך: "לפני שבוע אמרת X, היום אתה כבר Y"
+- אתגרים קטנים: "מאמין שתצליח לעשות X רק היום?"
+- חיזוקים חיוביים על הצלחות
+- ציפייה: "מחר אני רוצה לשמוע איך היה האימון"
+
+🥗 מעקב תזונה:
+אם המשתמש שולח תמונת אוכל — נתח עם קלוריות, חלבון/פחמימות/שומן, וטיפ אחד.
+
+💪 סגנון תקשורת:
+- הודעות קצרות (לא יותר מ-5 שורות)
+- הרבה אמוג'י
+- שאלה אחת בסוף כל הודעה
+
+📊 מצב המשתמש:
+- רצף ימים: ${user.streak}
+- יום היכרות: ${user.onboardingDay}
+
+אם זו ההודעה הראשונה — התחל עם ברכה אנרגטית ושאל את השם!`,
+        messages: user.history
       },
       {
         headers: {
@@ -52,10 +98,14 @@ app.post('/webhook', async (req, res) => {
         }
       }
     );
-    
+
     const reply = response.data.content[0].text;
-    users[userId].push({ role: 'assistant', content: reply });
-    
+    user.history.push({ role: 'assistant', content: reply });
+
+    if (user.onboardingDay < 3 && user.history.length > 6) {
+      user.onboardingDay = Math.min(3, Math.floor(user.history.length / 6) + 1);
+    }
+
     await axios.post(
       `https://graph.facebook.com/v18.0/${PHONE_NUMBER_ID}/messages`,
       {
@@ -70,7 +120,7 @@ app.post('/webhook', async (req, res) => {
         }
       }
     );
-    
+
   } catch (err) {
     console.error(err.response?.data || err.message);
   }
