@@ -487,6 +487,6 @@ connectDB().then(() => {
     console.log('מקס פועל!');
     console.log('MongoDB:', !!MONGODB_URI);
     console.log('YouTube API:', !!YOUTUBE_API_KEY);
-    console.log('WhatsApp:', !!WA_TOKEN);
+    console.log('WhatsApp:', !!WA_TOKEN, '- v2.0');
   });
 });
