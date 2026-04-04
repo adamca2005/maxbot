@@ -1,6 +1,7 @@
 const express = require('express');
 const axios = require('axios');
 const cron = require('node-cron');
+const { MongoClient } = require('mongodb');
 
 const app = express();
 app.use(express.json());
@@ -8,360 +9,315 @@ app.use(express.json());
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const WA_TOKEN = process.env.WA_TOKEN;
 const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
+const MONGODB_URI = process.env.MONGODB_URI;
+const YOUTUBE_API_KEY = process.env.YOUTUBE_API_KEY;
 const VERIFY_TOKEN = 'maxbot123';
 
-const users = {};
+// =================== MONGODB ===================
+let usersCollection;
+const memoryCache = {};
 
-function getUser(userId) {
-  if (!users[userId]) {
-    users[userId] = {
-      history: [],
-      onboardingDay: 1,
-      streak: 0,
-      lastCheckIn: null,
-      todayMeals: [],
-      pendingMeal: null,
-      profile: {
-        height: null, weight: null, bmi: null, waterGoal: null,
-        age: null, name: null, goals: []
-      },
-      medicalHistory: {
-        conditions: [],       // מחלות כרוניות
-        medications: [],      // תרופות
-        allergies: [],        // אלרגיות
-        bloodTests: [],       // בדיקות דם היסטוריה
-        lastBloodTest: null,  // בדיקה אחרונה
-        medicalAsked: false   // האם כבר שאלנו היסטוריה רפואית
-      },
-      lastActive: null,
-      waterReminders: 0,
-      weeklyChallenge: null,
-      challengeCompleted: false,
-      workoutPlan: null,
-      shownCapabilities: [],  // יכולות שכבר הוצגו
-      smartReminders: {
-        lastWorkoutReminder: null,
-        lastSleepReminder: null,
-        lastNutritionTip: null,
-        missedDays: 0
-      }
-    };
-  }
-  return users[userId];
-}
-
-// =================== MAX PERSONALITY ===================
-const MAX_PERSONALITY = `אתה "מקס" — מאמן חיים אישי בוויצאפ. אתה חוצפן, ישיר, מצחיק, ומלא אנרגיה. אתה מדבר בעברית או אנגלית לפי מה שהמשתמש כותב. אתה נחמד וחם — מברך תמיד עם "היי" או "היייי" ולא עם "יו יו יו".
-
-🎯 המשימה שלך:
-- לעזור לאנשים להגיע לפוטנציאל המקסימלי שלהם
-- לשפר תזונה, כושר, שינה ואיכות חיים כללית
-- להשתמש בעקרונות ביוהאקינג מדעיים
-- לשמש כמנחה דרך רפואי — לא להחליף רופא אלא לכוון ולהתריע
-
-📋 תהליך היכרות (3 ימים ראשונים):
-יום 1 - שאל על: שם, גיל, מטרות עיקריות, שגרת יום, גובה ומשקל
-יום 2 - שאל על: תזונה נוכחית, שעות שינה, רמת פעילות גופנית, עבודה/לחץ
-יום 3 - שאל על: מה ניסו בעבר ולא עבד, מכשולים גדולים, כמה זמן יש לשינוי
-
-כשמשתמש נותן גובה ומשקל — כתוב [SAVE_BMI:גובה:משקל] בתחילת התגובה.
-כשמשתמש נותן שם — כתוב [SAVE_NAME:שם] בתחילת התגובה.
-כשמשתמש נותן גיל — כתוב [SAVE_AGE:גיל] בתחילת התגובה.
-
-🧠 טכניקות מוטיבציה:
-- רצף ימים (streak): "אתה על רצף של X ימים — אל תשבור אותו!"
-- השוואה לעצמך: "לפני שבוע אמרת X, היום אתה כבר Y"
-- אתגרים קטנים: "מאמין שתצליח לעשות X רק היום?"
-- חיזוקים חיוביים: כשמשתמש מדווח על הצלחה — חגוג!
-- ציפייה: "מחר אני רוצה לשמוע איך היה האימון"
-
-💡 הצגת יכולות — חשוב מאוד:
-הצג יכולת חדשה רק כשיש הקשר טבעי בשיחה. לדוגמה:
-- אם המשתמש מדבר על עייפות → "אגב, אני יכול לנתח בדיקות דם ולבדוק אם יש לך חוסר ברזל או ויטמין D 🔬"
-- אם מדבר על כושר → "אגב, אני יכול לבנות לך תוכנית אימונים שבועית + סרטוני יוטיוב לכל תרגיל 💪"
-- אם מדבר על תזונה → "אגב, אני יכול לנתח תמונות של האוכל שלך ולחשב קלוריות ומינרלים 📸"
-
-💪 סגנון תקשורת:
-- הודעות קצרות וחדות (לא יותר מ-5 שורות)
-- הרבה אמוג'י
-- שאל שאלה אחת בסוף כל הודעה
-- אל תתן יותר מדי מידע בבת אחת
-
-אם זו ההודעה הראשונה — התחל עם ברכה אנרגטית ושאל את השם!`;
-
-// =================== WEBHOOK VERIFICATION ===================
-app.get('/webhook', (req, res) => {
-  const mode = req.query['hub.mode'];
-  const token = req.query['hub.verify_token'];
-  const challenge = req.query['hub.challenge'];
-  console.log('Webhook verification:', { mode, token });
-  if (mode === 'subscribe' && token === VERIFY_TOKEN) {
-    console.log('Webhook verified!');
-    res.status(200).send(challenge);
-  } else {
-    res.sendStatus(403);
-  }
-});
-
-// =================== WHATSAPP SEND ===================
-async function sendWhatsApp(userId, text) {
+async function connectDB() {
   try {
-    const response = await axios.post(
-      `https://graph.facebook.com/v21.0/${PHONE_NUMBER_ID}/messages`,
-      {
-        messaging_product: 'whatsapp',
-        recipient_type: 'individual',
-        to: userId,
-        type: 'text',
-        text: { body: text }
-      },
-      { headers: { 'Authorization': `Bearer ${WA_TOKEN}`, 'Content-Type': 'application/json' } }
-    );
-    console.log('Sent to', userId);
-    return response.data;
+    const client = new MongoClient(MONGODB_URI, { serverSelectionTimeoutMS: 5000 });
+    await client.connect();
+    const db = client.db('maxbot');
+    usersCollection = db.collection('users');
+    await usersCollection.createIndex({ userId: 1 }, { unique: true });
+    console.log('✅ MongoDB connected!');
   } catch (err) {
-    console.error('sendWhatsApp error:', err.response?.data || err.message);
-    throw err;
+    console.error('❌ MongoDB error:', err.message);
+    console.log('⚠️  Running in memory-only mode');
   }
 }
 
-// =================== DOWNLOAD IMAGE ===================
-async function downloadImage(mediaId) {
-  const mediaRes = await axios.get(
-    `https://graph.facebook.com/v21.0/${mediaId}`,
-    { headers: { 'Authorization': `Bearer ${WA_TOKEN}` } }
-  );
-  const imageRes = await axios.get(mediaRes.data.url, {
-    responseType: 'arraybuffer',
-    headers: { 'Authorization': `Bearer ${WA_TOKEN}` }
-  });
-  return {
-    base64: Buffer.from(imageRes.data).toString('base64'),
-    mimeType: mediaRes.data.mime_type || 'image/jpeg'
+// =================== USER LOAD / SAVE ===================
+async function getUser(userId) {
+  if (memoryCache[userId]) return memoryCache[userId];
+
+  if (usersCollection) {
+    try {
+      const doc = await usersCollection.findOne({ userId });
+      if (doc) { delete doc._id; memoryCache[userId] = doc; return doc; }
+    } catch (err) { console.error('getUser error:', err.message); }
+  }
+
+  const newUser = {
+    userId,
+    createdAt: new Date(),
+    history: [],
+    summaryHistory: [],
+    onboardingDay: 1,
+    streak: 0,
+    lastCheckIn: null,
+    todayMeals: [],
+    pendingMeal: null,
+    profile: { height: null, weight: null, bmi: null, waterGoal: null, age: null, name: null, goals: [] },
+    medicalHistory: { conditions: [], medications: [], allergies: [], bloodTests: [], lastBloodTest: null, medicalAsked: false },
+    fitnessData: { todaySteps: 0, todayWorkoutMinutes: 0, todayWorkoutType: null, weeklySteps: [], weeklyWorkouts: [], stepGoal: 8000 },
+    lastActive: null,
+    waterReminders: 0,
+    weeklyChallenge: null,
+    challengeCompleted: false,
+    workoutPlan: null,
+    shownCapabilities: [],
+    proactive: { lastRandomMessage: null, randomMessageCount: 0 }
   };
+
+  memoryCache[userId] = newUser;
+  await saveUser(newUser);
+  return newUser;
 }
 
-// =================== BMI ===================
-function calculateBMI(height, weight) {
-  const h = height / 100;
-  const bmi = (weight / (h * h)).toFixed(1);
-  let status = '';
-  if (bmi < 18.5) status = 'תת משקל';
-  else if (bmi < 25) status = 'משקל תקין ✅';
-  else if (bmi < 30) status = 'עודף משקל';
-  else status = 'השמנה';
-  const waterGoal = Math.round(weight * 35);
-  return { bmi, status, waterGoal };
+async function saveUser(user) {
+  memoryCache[user.userId] = user;
+  if (!usersCollection) return;
+  try {
+    await usersCollection.replaceOne({ userId: user.userId }, { ...user, updatedAt: new Date() }, { upsert: true });
+  } catch (err) { console.error('saveUser error:', err.message); }
 }
 
-// =================== DAILY REPORT ===================
-function generateDailyReport(meals) {
-  if (!meals || meals.length === 0) return null;
-  let totalCalories = 0, totalProtein = 0, totalCarbs = 0, totalFat = 0, totalSugar = 0;
-  const minerals = {};
-  for (const meal of meals) {
-    const d = meal.data || meal;
-    totalCalories += d.calories || 0;
-    totalProtein += d.protein || 0;
-    totalCarbs += d.carbs || 0;
-    totalFat += d.fat || 0;
-    totalSugar += d.sugar || 0;
-    if (d.minerals) {
-      for (const [k, v] of Object.entries(d.minerals)) {
-        minerals[k] = (minerals[k] || 0) + v;
-      }
-    }
+// =================== HISTORY MANAGEMENT ===================
+async function addToHistory(user, role, content) {
+  user.history.push({ role, content, timestamp: new Date() });
+
+  // כל 40 הודעות — סכם את 20 הישנות ושמור
+  if (user.history.length > 40) {
+    const toSummarize = user.history.splice(0, 20);
+    try {
+      const text = toSummarize.map(m => `${m.role === 'user' ? 'משתמש' : 'מקס'}: ${m.content}`).join('\n');
+      const summary = await callClaude([{
+        role: 'user',
+        content: `סכם את השיחה הבאה ב-6 משפטים קצרים. שמור: מטרות, בעיות, הישגים, נושאים חשובים. גוף שלישי.\n\n${text}`
+      }], null, 350);
+      user.summaryHistory.push({ summary, date: new Date(), count: toSummarize.length });
+      if (user.summaryHistory.length > 10) user.summaryHistory = user.summaryHistory.slice(-10);
+      console.log(`Compressed ${toSummarize.length} messages to summary for ${user.userId}`);
+    } catch (e) { console.error('Summary error:', e.message); }
   }
-  return { totalCalories, totalProtein, totalCarbs, totalFat, totalSugar, minerals, mealCount: meals.length };
+}
+
+function buildContext(user) {
+  const summaryText = user.summaryHistory?.length > 0
+    ? '📚 היסטוריה קודמת:\n' + user.summaryHistory.map((s, i) =>
+        `[${new Date(s.date).toLocaleDateString('he-IL')}]: ${s.summary}`).join('\n\n')
+    : '';
+  return { summaryText, recentHistory: user.history.slice(-30) };
 }
 
 // =================== CLAUDE API ===================
 async function callClaude(messages, systemPrompt, maxTokens = 1000) {
   const body = { model: 'claude-sonnet-4-20250514', max_tokens: maxTokens, messages };
   if (systemPrompt) body.system = systemPrompt;
-  const response = await axios.post(
-    'https://api.anthropic.com/v1/messages',
-    body,
-    {
-      headers: {
-        'x-api-key': ANTHROPIC_API_KEY,
-        'anthropic-version': '2023-06-01',
-        'content-type': 'application/json'
+  const res = await axios.post('https://api.anthropic.com/v1/messages', body, {
+    headers: { 'x-api-key': ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' }
+  });
+  return res.data.content[0].text;
+}
+
+// =================== YOUTUBE API ===================
+async function searchYouTube(query, maxResults = 3) {
+  try {
+    const res = await axios.get('https://www.googleapis.com/youtube/v3/search', {
+      params: {
+        part: 'snippet',
+        q: query,
+        type: 'video',
+        maxResults,
+        relevanceLanguage: 'he',
+        key: YOUTUBE_API_KEY
       }
-    }
-  );
-  return response.data.content[0].text;
+    });
+
+    return res.data.items.map(item => ({
+      title: item.snippet.title,
+      channel: item.snippet.channelTitle,
+      videoId: item.id.videoId,
+      url: `https://www.youtube.com/watch?v=${item.id.videoId}`,
+      description: item.snippet.description?.substring(0, 100) || ''
+    }));
+  } catch (err) {
+    console.error('YouTube API error:', err.response?.data || err.message);
+    return null;
+  }
 }
 
-// =================== YOUTUBE RECOMMENDATIONS ===================
 async function getYouTubeRecommendations(topic, type = 'exercise') {
-  // מקס מייצר המלצות יוטיוב חכמות לפי נושא
-  const prompt = type === 'exercise'
-    ? `אתה מקס. המשתמש צריך סרטוני יוטיוב לתרגיל/כושר: "${topic}"
-      
-תן 3 המלצות חיפוש ביוטיוב בפורמט:
+  // קלוד מייצר שאילתות חיפוש חכמות
+  const queriesText = await callClaude([{
+    role: 'user',
+    content: `תן 3 שאילתות חיפוש ביוטיוב ל"${topic}" (${type === 'health' ? 'בריאות/מדע' : 'כושר/תרגיל'}).
+כל שאילתה בשורה נפרדת. חלק בעברית וחלק באנגלית. ללא מספרים, ללא הסברים.`
+  }], null, 120);
 
-🎬 סרטונים מומלצים ביוטיוב לـ"${topic}":
+  const queries = queriesText.trim().split('\n').filter(q => q.trim()).slice(0, 3);
 
-1️⃣ חפש: "[מחרוזת חיפוש מדויקת באנגלית]"
-   📝 [מה תלמד מהסרטון הזה - משפט אחד]
+  let msg = `${type === 'health' ? '🎓' : '🎬'} סרטונים ביוטיוב על "${topic}":\n\n`;
 
-2️⃣ חפש: "[מחרוזת חיפוש מדויקת באנגלית]"
-   📝 [מה תלמד]
+  for (let i = 0; i < queries.length; i++) {
+    const query = queries[i].trim();
+    const emoji = ['1️⃣', '2️⃣', '3️⃣'][i];
+    const videos = await searchYouTube(query, 1);
 
-3️⃣ חפש: "[מחרוזת חיפוש מדויקת באנגלית]"
-   📝 [מה תלמד]
+    if (videos && videos.length > 0) {
+      const v = videos[0];
+      msg += `${emoji} *${v.title}*\n`;
+      msg += `   📺 ${v.channel}\n`;
+      msg += `   🔗 ${v.url}\n\n`;
+    } else {
+      // fallback לקישור חיפוש אם API נכשל
+      msg += `${emoji} ${query}\n`;
+      msg += `   🔗 https://www.youtube.com/results?search_query=${encodeURIComponent(query)}\n\n`;
+    }
+  }
 
-💡 טיפ: חפש ב-YouTube את המחרוזות האלה בדיוק לתוצאות הטובות ביותר!`
-    : `אתה מקס. המשתמש רוצה ללמוד על הנושא: "${topic}" (ויטמינים/הורמונים/בריאות)
-
-תן 3 המלצות סרטונים חינוכיים:
-
-🎓 סרטונים מומלצים ביוטיוב על "${topic}":
-
-1️⃣ חפש: "[מחרוזת חיפוש מדויקת באנגלית]"
-   📝 [מה תלמד - ברמה מדעית/נגישה]
-
-2️⃣ חפש: "[מחרוזת חיפוש מדויקת באנגלית]"  
-   📝 [זווית שונה על הנושא]
-
-3️⃣ חפש: "[מחרוזת חיפוש מדויקת באנגלית - עברית אם קיים]"
-   📝 [תוכן בעברית אם אפשר]
-
-💡 ערוצים מומלצים לנושא זה: [2-3 ערוצים רלוונטיים]`;
-
-  return await callClaude([{ role: 'user', content: prompt }], null, 600);
+  return msg.trim();
 }
 
-// =================== MEDICAL HISTORY QUESTION ===================
-function getMedicalHistoryQuestion() {
-  return `🏥 לפני שממשיכים — אני רוצה להכיר אותך טוב יותר כדי לתת לך ייעוץ מדויק!
+// =================== MAX PERSONALITY ===================
+const MAX_PERSONALITY = `אתה "מקס" — מאמן חיים אישי בוויצאפ. חוצפן, ישיר, מצחיק, מלא אנרגיה. מדבר עברית או אנגלית לפי המשתמש. חם — מברך עם "היי" / "היייי" ולא "יו יו יו".
 
-שאלה אחת חשובה: האם יש לך:
-1. מחלות כרוניות? (סוכרת, לחץ דם, בעיות לב וכו׳)
-2. תרופות שאתה לוקח?
-3. אלרגיות למזון?
+🎯 המשימה: פוטנציאל מקסימלי — תזונה, כושר, שינה, ביוהאקינג. מנחה דרך רפואי — לא מחליף רופא.
 
-כתוב הכל בחופשיות — זה נשאר בינינו 🔒
-אם אין כלום — כתוב "בריא לחלוטין" ונמשיך 💪
+📋 היכרות (3 ימים): יום1: שם,גיל,מטרות,גובה,משקל | יום2: תזונה,שינה,כושר,לחץ | יום3: מה לא עבד,מכשולים,זמן
 
-⚠️ תזכורת: אני מנחה דרך ולא מחליף רופא — תמיד להתייעץ עם רופא לגבי שינויים רפואיים משמעותיים.`;
+📌 כשמקבל גובה+משקל → [SAVE_BMI:גובה:משקל]
+📌 כשמקבל שם → [SAVE_NAME:שם]
+📌 כשמקבל גיל → [SAVE_AGE:גיל]
+
+🧠 השתמש בהיסטוריה! התייחס לדברים שנאמרו בשיחות קודמות.
+💡 הצג יכולת חדשה רק כשיש הקשר טבעי.
+💪 סגנון: עד 5 שורות, אמוג'י, שאלה אחת בסוף. הודעה ראשונה — ברכה + שם!`;
+
+// =================== SEND WHATSAPP ===================
+async function sendWhatsApp(userId, text) {
+  try {
+    await axios.post(`https://graph.facebook.com/v21.0/${PHONE_NUMBER_ID}/messages`,
+      { messaging_product: 'whatsapp', recipient_type: 'individual', to: userId, type: 'text', text: { body: text } },
+      { headers: { 'Authorization': `Bearer ${WA_TOKEN}`, 'Content-Type': 'application/json' } }
+    );
+  } catch (err) { console.error('sendWhatsApp error:', err.response?.data || err.message); throw err; }
 }
 
-// =================== BLOOD TEST ANALYSIS ===================
-async function analyzeBloodTest(testData, userProfile, medicalHistory) {
-  const prompt = `אתה מקס — מנחה בריאות מומחה. נתח את תוצאות בדיקת הדם הבאות.
-
-פרופיל המשתמש:
-- גיל: ${userProfile.age || 'לא ידוע'} | גובה: ${userProfile.height || 'לא ידוע'}cm | משקל: ${userProfile.weight || 'לא ידוע'}kg
-- מחלות ידועות: ${medicalHistory.conditions.join(', ') || 'אין'}
-- תרופות: ${medicalHistory.medications.join(', ') || 'אין'}
-
-תוצאות הבדיקה:
-${testData}
-
-נתח לפי הפורמט הבא:
-
-🔬 ניתוח בדיקות דם — מקס:
-
-✅ תקין:
-[ערכים שבתחום הנורמה]
-
-⚠️ דורש תשומת לב:
-[ערכים גבוליים עם הסבר]
-
-🚨 חריג — ממליץ לדון עם רופא:
-[ערכים חריגים ומה המשמעות]
-
-💊 חוסרים שזוהו:
-[ויטמינים/מינרלים נמוכים + מקורות מזון להשלמה]
-
-📈 עודפים שזוהו:
-[ערכים גבוהים מדי ומה כדאי להפחית]
-
-🔗 שילובים מעניינים:
-[קשרים בין הערכים שעשויים להעיד על משהו]
-
-🥗 המלצות תזונה לפי הבדיקה:
-[3 המלצות ספציפיות]
-
-⚕️ חשוב: אני מנחה דרך ולא רופא — שתף את הממצאים האלה עם הרופא שלך לאישור!`;
-
-  return await callClaude([{ role: 'user', content: prompt }], null, 1500);
+// =================== DOWNLOAD MEDIA ===================
+async function downloadMedia(mediaId) {
+  const mediaRes = await axios.get(`https://graph.facebook.com/v21.0/${mediaId}`, { headers: { 'Authorization': `Bearer ${WA_TOKEN}` } });
+  const fileRes = await axios.get(mediaRes.data.url, { responseType: 'arraybuffer', headers: { 'Authorization': `Bearer ${WA_TOKEN}` } });
+  return { base64: Buffer.from(fileRes.data).toString('base64'), mimeType: mediaRes.data.mime_type || 'image/jpeg' };
 }
 
-// =================== SMART REMINDERS ENGINE ===================
-async function generateSmartReminder(user, userId) {
-  const now = new Date();
-  const hour = now.getHours();
-  const dayOfWeek = now.getDay();
-  const profile = user.profile;
-  const reminders = user.smartReminders;
+// =================== BMI ===================
+function calculateBMI(h, w) {
+  const bmi = (w / ((h / 100) ** 2)).toFixed(1);
+  const status = bmi < 18.5 ? 'תת משקל' : bmi < 25 ? 'משקל תקין ✅' : bmi < 30 ? 'עודף משקל' : 'השמנה';
+  return { bmi, status, waterGoal: Math.round(w * 35) };
+}
 
-  // בוקר (6-9) — תזכורת שגרת בוקר
-  if (hour >= 6 && hour <= 9) {
-    const tips = [
-      `☀️ ${profile.name || 'היי'}! בוקר טוב!\n\n🥛 שתה כוס מים עם לימון עכשיו\n☀️ 10 דקות שמש = ויטמין D טבעי\n🧘 3 נשימות עמוקות לפני הטלפון\n\nהיום אתה על רצף של ${user.streak} ימים 🔥`,
-      `🌅 ${profile.name || 'היי'}! הגוף שלך מחכה לך!\n\n💪 5 דקות מתיחות עכשיו = אנרגיה לכל היום\n🥚 ארוחת בוקר עם חלבון = פוקוס מקסימלי\n\nמה האימון שלך היום? 💪`
-    ];
-    return tips[Math.floor(Math.random() * tips.length)];
+// =================== DAILY REPORT ===================
+function buildDailyReport(meals) {
+  if (!meals?.length) return null;
+  const totals = { calories: 0, protein: 0, carbs: 0, fat: 0, sugar: 0 };
+  const minerals = {};
+  for (const meal of meals) {
+    const d = meal.data || meal;
+    for (const k of Object.keys(totals)) totals[k] += d[k] || 0;
+    if (d.minerals) for (const [k, v] of Object.entries(d.minerals)) minerals[k] = (minerals[k] || 0) + v;
   }
+  return { ...totals, minerals, mealCount: meals.length };
+}
 
-  // אחה"צ (14-16) — תזכורת אנרגיה
-  if (hour >= 14 && hour <= 16) {
-    return `⚡ ${profile.name || 'היי'}! הדיפ של אחה"צ מגיע...\n\n💡 במקום קפה:\n• כוס מים קרה + הליכה 5 דק׳\n• חופן אגוזים לאנרגיה יציבה\n• 10 קפיצות להחייאת הגוף\n\nהגוף שלך מבקש ${profile.waterGoal || 2500}ml מים ביום 💧\nכמה שתית עד עכשיו?`;
-  }
+// =================== FITNESS ===================
+function parseFitness(msg, user) {
+  const steps = msg.match(/(\d[\d,]*)\s*(?:צעדים|steps)/i);
+  const workout = msg.match(/(?:אימון|ריצה|הליכה|gym|חדר כושר|יוגה|שחייה|אופניים)[^\d]*(\d+)?\s*(?:דק|דקות|min|שעה)?/i);
+  let updated = false;
+  if (steps) { user.fitnessData.todaySteps = parseInt(steps[1].replace(',', '')); updated = true; }
+  if (workout) { user.fitnessData.todayWorkoutMinutes += workout[1] ? parseInt(workout[1]) : 45; user.fitnessData.todayWorkoutType = workout[0].split(/\d/)[0].trim(); updated = true; }
+  return updated;
+}
 
-  // ערב (19-21) — סיכום יום
-  if (hour >= 19 && hour <= 21) {
-    const mealCount = user.todayMeals.length;
-    return `🌙 ${profile.name || 'היי'}! סיכום יום מהיר:\n\n${mealCount > 0 ? `📸 תיעדת ${mealCount} ארוחות — כל הכבוד!` : '📸 עוד לא תיעדת ארוחות היום — שלח תמונה!'}\n💧 שתית מספיק מים?\n😴 מטרת שינה: 22:30 לשינה איכותית\n\nשלח "דוח יומי" לסיכום מלא 📊`;
-  }
+function fitnessBar(user) {
+  const fd = user.fitnessData;
+  const goal = fd.stepGoal || 8000;
+  const pct = Math.min(100, Math.round((fd.todaySteps / goal) * 100));
+  const bar = '█'.repeat(Math.floor(pct / 10)) + '░'.repeat(10 - Math.floor(pct / 10));
+  return `📊 כושר:\n👟 ${fd.todaySteps.toLocaleString()}/${goal.toLocaleString()} [${bar}] ${pct}%\n💪 אימון: ${fd.todayWorkoutMinutes > 0 ? `${fd.todayWorkoutMinutes} דקות` : 'לא דווח'}`;
+}
 
-  // יום ב׳/ה׳ — תזכורת אימון
-  if ((dayOfWeek === 1 || dayOfWeek === 4) && !reminders.lastWorkoutReminder) {
-    reminders.lastWorkoutReminder = now;
-    return `💪 ${profile.name || 'היי'}! יום אימון מושלם היום!\n\nלא פספסת? 🏃‍♂️\nשלח "תוכנית אימונים" אם צריך תוכנית\nאו שלח סרטון/תמונה מהאימון ואתגיב 🔥\n\nהרצף שלך: ${user.streak} ימים 🔥`;
-  }
+// =================== BLOOD TEST ===================
+async function analyzeBloodTest(data, profile, med) {
+  return await callClaude([{
+    role: 'user',
+    content: `מקס — מנחה בריאות. נתח בדיקת דם.
+פרופיל: גיל ${profile.age || '?'}, ${profile.height || '?'}cm, ${profile.weight || '?'}kg
+מחלות: ${med.conditions.join(', ') || 'אין'} | תרופות: ${med.medications.join(', ') || 'אין'}
+בדיקה:\n${data}
 
-  return null;
+✅ תקין | ⚠️ גבולי | 🚨 חריג
+💊 חוסרים + מקורות מזון | 📈 עודפים | 🔗 שילובים חשודים
+🥗 3 המלצות תזונה ספציפיות
+⚕️ תזכורת: מנחה — לא רופא!`
+  }], null, 1400);
+}
+
+// =================== WEEKLY CHALLENGE ===================
+async function generateChallenge(user) {
+  const lastSummary = user.summaryHistory?.slice(-1)[0]?.summary || '';
+  return await callClaude([{
+    role: 'user',
+    content: `מקס. אתגר שבועי מותאם.
+${user.profile.height || '?'}cm, ${user.profile.weight || '?'}kg, רצף ${user.streak}
+מגבלות: ${user.medicalHistory.conditions.join(', ') || 'אין'}
+${lastSummary ? `היסטוריה: ${lastSummary}` : ''}
+
+🏆 האתגר: [שם]
+📋 המשימה: [ספציפי]
+🎯 הצלחה: [קריטריון]
+💡 טיפ: [אחד]
+כשתסיים → "השלמתי אתגר" 🎉`
+  }], null, 380);
+}
+
+// =================== WORKOUT PLAN ===================
+async function generateWorkoutPlan(user) {
+  return await callClaude([{
+    role: 'user',
+    content: `מקס. תוכנית אימונים שבועית מותאמת.
+${user.profile.height || '?'}cm | ${user.profile.weight || '?'}kg | BMI ${user.profile.bmi || '?'} | גיל ${user.profile.age || '?'}
+מגבלות: ${user.medicalHistory.conditions.join(', ') || 'אין'}
+
+💪 תוכנית 7 ימים:
+📅 [כל יום עם תרגילים + סטים + מנוחה]
+⏱️ ~X דקות | 💡 טיפ אחד`
+  }], null, 1200);
+}
+
+// =================== PROACTIVE ===================
+async function randomProactive(user) {
+  const name = user.profile.name || '';
+  const lastSummary = user.summaryHistory?.slice(-1)[0]?.summary || '';
+  const types = [
+    () => callClaude([{ role: 'user', content: `מקס. רעיון ביוהאקינג מפתיע ל${name || 'משתמש'}.${lastSummary ? ` הקשר: ${lastSummary}` : ''}\n💡 [רעיון קצר רלוונטי]. 3 שורות + שאלה.` }], null, 150),
+    () => callClaude([{ role: 'user', content: `מקס. עובדה מדעית מפתיעה על גוף האדם. 🧠 [עובדה]. "ידעת?" 2 שורות.` }], null, 120),
+    () => callClaude([{ role: 'user', content: `מקס. הודעה אישית ספונטנית ל${name || 'משתמש'}.${lastSummary ? ` מהשיחות: ${lastSummary}` : ''}\nרצף: ${user.streak}. כאילו עלה לך רעיון — חם, ישיר, 3 שורות + שאלה.` }], null, 150),
+    () => callClaude([{ role: 'user', content: `מקס. אתגר מיני ל-24 שעות. ⚡ אתגר: [פשוט ומדיד]. "עושה?" 2 שורות.` }], null, 100),
+  ];
+  return await types[Math.floor(Math.random() * types.length)]();
 }
 
 // =================== CAPABILITY HINTS ===================
-function getCapabilityHint(message, user) {
+function capabilityHint(msg, user) {
   const shown = user.shownCapabilities || [];
-  const msg = message.toLowerCase();
-
-  const capabilities = [
-    {
-      id: 'blood_test',
-      triggers: ['עייפות', 'עייף', 'חלש', 'אנרגיה נמוכה', 'שיער', 'ציפורניים', 'ריכוז'],
-      hint: `\n\n🔬 אגב — אני יכול לנתח בדיקות דם ולזהות חוסרים בויטמינים ומינרלים. יש לך בדיקות אחרונות? שלח את הערכים ואבדוק!`
-    },
-    {
-      id: 'youtube_exercise',
-      triggers: ['תרגיל', 'אימון', 'כושר', 'שריר', 'בטן', 'גב', 'רגליים', 'כתפיים'],
-      hint: `\n\n🎬 אגב — אני יכול לשלוח לך סרטוני יוטיוב מדויקים לכל תרגיל! רוצה המלצות?`
-    },
-    {
-      id: 'youtube_health',
-      triggers: ['ויטמין', 'הורמון', 'קורטיזול', 'טסטוסטרון', 'אינסולין', 'תיירואיד', 'מגנזיום'],
-      hint: `\n\n🎓 אגב — יש סרטונים מעולים ביוטיוב על הנושא הזה. רוצה שאמליץ לך על הטובים ביותר?`
-    },
-    {
-      id: 'food_photo',
-      triggers: ['אכלתי', 'אוכל', 'ארוחה', 'קלוריות', 'מה לאכול'],
-      hint: `\n\n📸 אגב — אני יכול לנתח תמונות של האוכל שלך ולחשב קלוריות, חלבון ומינרלים באופן אוטומטי!`
-    },
-    {
-      id: 'medical_history',
-      triggers: ['כאב', 'בעיה', 'מחלה', 'תרופה', 'רופא', 'בריאות'],
-      hint: `\n\n🏥 אגב — לא שאלתי אותך עדיין על ההיסטוריה הרפואית שלך. זה עוזר לי לתת עצות מדויקות יותר. נעשה את זה?`
-    }
+  const m = msg.toLowerCase();
+  const caps = [
+    { id: 'blood_test', triggers: ['עייפות', 'עייף', 'חלש', 'אנרגיה', 'שיער', 'ריכוז'], hint: `\n\n🔬 אגב — אני יכול לנתח בדיקות דם ולזהות חוסרים. יש לך בדיקות?` },
+    { id: 'youtube', triggers: ['תרגיל', 'אימון', 'כושר', 'ויטמין', 'הורמון'], hint: `\n\n🎬 אגב — אני יכול לשלוח לך סרטוני יוטיוב אמיתיים עם קישורים! רוצה?` },
+    { id: 'food_photo', triggers: ['אכלתי', 'ארוחה', 'קלוריות', 'רעב'], hint: `\n\n📸 אגב — שלח תמונת אוכל ואנתח קלוריות ומינרלים!` },
+    { id: 'fitness', triggers: ['צעדים', 'הליכה', 'ריצה'], hint: `\n\n📊 אגב — דווח על צעדים ואימונים ואעקוב אחרי ההתקדמות!` },
+    { id: 'memory', triggers: ['שכחתי', 'דיברנו', 'אמרתי'], hint: `\n\n🧠 אגב — אני זוכר את כל השיחות שלנו! אפשר לשאול מה דיברנו.` }
   ];
-
-  for (const cap of capabilities) {
-    if (!shown.includes(cap.id) && cap.triggers.some(t => msg.includes(t))) {
+  for (const cap of caps) {
+    if (!shown.includes(cap.id) && cap.triggers.some(t => m.includes(t))) {
       user.shownCapabilities.push(cap.id);
       return cap.hint;
     }
@@ -369,463 +325,319 @@ function getCapabilityHint(message, user) {
   return '';
 }
 
-// =================== GENERATE WEEKLY CHALLENGE ===================
-async function generateWeeklyChallenge(user) {
-  const profile = user.profile;
-  return await callClaude([{
-    role: 'user',
-    content: `אתה מקס — מאמן חיים. צור אתגר שבועי אחד מותאם אישית.
-פרופיל: גובה ${profile.height || 'לא ידוע'}cm, משקל ${profile.weight || 'לא ידוע'}kg, רצף: ${user.streak} ימים
-מחלות ידועות: ${user.medicalHistory.conditions.join(', ') || 'אין'}
-
-האתגר: ריאלי, ספציפי, מדיד תוך שבוע.
-
-🏆 האתגר השבועי שלך:
-[שם]
-
-📋 המשימה: [תיאור ספציפי]
-🎯 הצלחה: [קריטריון ברור]
-💡 טיפ: [טיפ אחד]
-
-כשתסיים — כתוב "השלמתי אתגר" 🎉`
-  }], null, 500);
-}
-
-// =================== GENERATE WORKOUT PLAN ===================
-async function generateWorkoutPlan(user) {
-  const profile = user.profile;
-  const med = user.medicalHistory;
-  return await callClaude([{
-    role: 'user',
-    content: `אתה מקס — מאמן כושר. בנה תוכנית אימונים שבועית מותאמת.
-
-פרופיל:
-- גובה: ${profile.height || 'לא ידוע'}cm | משקל: ${profile.weight || 'לא ידוע'}kg | BMI: ${profile.bmi || 'לא ידוע'}
-- גיל: ${profile.age || 'לא ידוע'} | רצף: ${user.streak} ימים
-- מגבלות רפואיות: ${med.conditions.join(', ') || 'אין'}
-- תרופות: ${med.medications.join(', ') || 'אין'}
-
-💪 תוכנית האימונים השבועית:
-
-📅 יום א׳ — [שם]:
-• [תרגיל]: X סטים × X חזרות
-[המשך ל-7 ימים כולל מנוחה]
-
-⏱️ זמן ליום: ~X דקות
-💡 טיפ חשוב: [אחד]`
-  }], null, 1500);
-}
-
-// =================== CRON: ציטוט בוקר 8:00 ===================
-cron.schedule('0 8 * * *', async () => {
-  for (const [userId, user] of Object.entries(users)) {
-    if (!user.lastActive) continue;
-    const h = (new Date() - new Date(user.lastActive)) / (1000 * 60 * 60);
-    if (h > 48) continue;
+// =================== ALL USERS HELPER ===================
+async function getActiveUsers(hoursAgo) {
+  if (usersCollection) {
     try {
-      const quote = await callClaude([{
-        role: 'user',
-        content: `אתה מקס. ציטוט מוטיבציה בוקר קצר ואנרגטי.
-${user.profile.name ? `שם המשתמש: ${user.profile.name}` : ''}
-רצף: ${user.streak} ימים.
+      return await usersCollection.find({ lastActive: { $gt: new Date(Date.now() - hoursAgo * 3600000) } }).toArray();
+    } catch (e) { return Object.values(memoryCache); }
+  }
+  return Object.values(memoryCache).filter(u => u.lastActive && (Date.now() - new Date(u.lastActive)) / 3600000 < hoursAgo);
+}
 
-🌅 בוקר טוב${user.profile.name ? ` ${user.profile.name}` : ''}! [יום בשבוע] מתחיל עכשיו!
-
-💬 "[ציטוט — משפט אחד]"
-— [מחבר]
-
-🔥 [משפט אישי ממקס לפי הרצף]
-
-מה התוכנית היום? 💪`
-      }], null, 250);
-      await sendWhatsApp(userId, quote);
+// =================== CRONS ===================
+// ☀️ ציטוט בוקר 8:00
+cron.schedule('0 8 * * *', async () => {
+  const users = await getActiveUsers(48);
+  for (const user of users) {
+    try {
+      const q = await callClaude([{ role: 'user', content: `מקס. ציטוט בוקר.${user.profile?.name ? ` שם: ${user.profile.name}.` : ''} רצף: ${user.streak || 0} ימים.\n🌅 בוקר טוב! 💬 "[ציטוט]" — [מחבר] 🔥 [ממקס]. מה התוכנית? 💪` }], null, 170);
+      await sendWhatsApp(user.userId, q);
     } catch (e) { console.error('Morning quote error:', e.message); }
   }
 }, { timezone: 'Asia/Jerusalem' });
 
-// =================== CRON: תזכורת חכמה 13:00 ===================
+// ⚡ עדכון צהריים 13:00
 cron.schedule('0 13 * * *', async () => {
-  for (const [userId, user] of Object.entries(users)) {
-    if (!user.lastActive) continue;
-    const h = (new Date() - new Date(user.lastActive)) / (1000 * 60 * 60);
-    if (h > 24) continue;
+  const users = await getActiveUsers(24);
+  for (const user of users) {
     try {
-      const reminder = await generateSmartReminder(user, userId);
-      if (reminder) await sendWhatsApp(userId, reminder);
-    } catch (e) { console.error('Smart reminder error:', e.message); }
+      const msg = `⚡ עדכון צהריים${user.profile?.name ? ` ${user.profile.name}` : ''}!\n${user.todayMeals?.length > 0 ? `🍽️ ${user.todayMeals.length} ארוחות מתועדות` : '📸 עוד לא תיעדת ארוחה!'}\n${user.fitnessData?.todaySteps > 0 ? `👟 ${user.fitnessData.todaySteps.toLocaleString()} צעדים` : '👟 דווח על הצעדים!'}\n💧 שתית מים? 💪`;
+      await sendWhatsApp(user.userId, msg);
+    } catch (e) { console.error('Midday error:', e.message); }
   }
 }, { timezone: 'Asia/Jerusalem' });
 
-// =================== CRON: סיכום ערב 20:00 ===================
+// 🌙 סיכום ערב 20:00
 cron.schedule('0 20 * * *', async () => {
-  for (const [userId, user] of Object.entries(users)) {
-    if (!user.lastActive) continue;
-    const h = (new Date() - new Date(user.lastActive)) / (1000 * 60 * 60);
-    if (h > 24) continue;
+  const users = await getActiveUsers(24);
+  for (const user of users) {
     try {
-      const mealCount = user.todayMeals.length;
-      const name = user.profile.name || '';
-      const msg = `🌙 סיכום יום${name ? ` — ${name}` : ''}!\n\n${mealCount > 0 ? `✅ תיעדת ${mealCount} ארוחות היום` : '⚠️ לא תיעדת ארוחות היום'}\n💧 שתית מספיק מים?\n😴 לך לישון לפני 23:00 לאחזור מיטבי\n🔥 רצף: ${user.streak} ימים\n\nשלח "דוח יומי" לסיכום תזונה מלא 📊`;
-      await sendWhatsApp(userId, msg);
-    } catch (e) { console.error('Evening summary error:', e.message); }
+      const fd = user.fitnessData || {};
+      const goal = fd.stepGoal || 8000;
+      const icon = (fd.todaySteps || 0) >= goal ? '✅' : (fd.todaySteps || 0) > 0 ? '⚡' : '❌';
+      const msg = `🌙 סיכום יום!\n${icon} צעדים: ${(fd.todaySteps || 0).toLocaleString()}/${goal.toLocaleString()}\n💪 אימון: ${fd.todayWorkoutMinutes > 0 ? `${fd.todayWorkoutMinutes} דקות` : 'לא דווח'}\n🍽️ ארוחות: ${user.todayMeals?.length || 0} | 🔥 רצף: ${user.streak || 0} ימים\n😴 שינה לפני 23:00! שלח "דוח יומי" לסיכום 📊`;
+      await sendWhatsApp(user.userId, msg);
+    } catch (e) { console.error('Evening error:', e.message); }
   }
 }, { timezone: 'Asia/Jerusalem' });
 
-// =================== CRON: אתגר שבועי ראשון 9:30 ===================
+// 💡 הודעות אקראיות — 3 חלונות ביום
+for (const hour of [10, 15, 18]) {
+  cron.schedule(`0 ${hour} * * *`, async () => {
+    if (Math.random() > 0.5) return; // 50% הסתברות
+    const users = await getActiveUsers(48);
+    for (const user of users) {
+      if (user.proactive?.lastRandomMessage) {
+        if ((Date.now() - new Date(user.proactive.lastRandomMessage)) / 3600000 < 4) continue;
+      }
+      try {
+        const msg = await randomProactive(user);
+        await sendWhatsApp(user.userId, msg);
+        if (!user.proactive) user.proactive = {};
+        user.proactive.lastRandomMessage = new Date();
+        user.proactive.randomMessageCount = (user.proactive.randomMessageCount || 0) + 1;
+        await saveUser(user);
+      } catch (e) { console.error('Proactive error:', e.message); }
+    }
+  }, { timezone: 'Asia/Jerusalem' });
+}
+
+// 🏆 אתגר שבועי ראשון 9:30
 cron.schedule('30 9 * * 0', async () => {
-  for (const [userId, user] of Object.entries(users)) {
-    if (!user.lastActive) continue;
-    const h = (new Date() - new Date(user.lastActive)) / (1000 * 60 * 60);
-    if (h > 72) continue;
+  const users = await getActiveUsers(72);
+  for (const user of users) {
     try {
-      const challenge = await generateWeeklyChallenge(user);
+      const challenge = await generateChallenge(user);
       user.weeklyChallenge = challenge;
       user.challengeCompleted = false;
-      await sendWhatsApp(userId, challenge);
-    } catch (e) { console.error('Weekly challenge error:', e.message); }
+      if (user.fitnessData) { user.fitnessData.weeklySteps.push(user.fitnessData.todaySteps || 0); user.fitnessData.todaySteps = 0; user.fitnessData.todayWorkoutMinutes = 0; }
+      await saveUser(user);
+      await sendWhatsApp(user.userId, challenge);
+    } catch (e) { console.error('Challenge error:', e.message); }
   }
 }, { timezone: 'Asia/Jerusalem' });
 
-// =================== CRON: מים כל 2 שעות ===================
+// 💧 מים כל 2 שעות (8-22)
 cron.schedule('0 */2 * * *', async () => {
-  const now = new Date();
-  for (const [userId, user] of Object.entries(users)) {
-    if (!user.lastActive) continue;
-    const h = (now - new Date(user.lastActive)) / (1000 * 60 * 60);
-    if (h > 24) continue;
-    const waterGoal = user.profile?.waterGoal || 2500;
-    const msgs = [
-      `💧 זמן לשתות מים!\nמטרה יומית: ${waterGoal}ml 🙏`,
-      `💦 תזכורת מים! מים = אנרגיה = ביצועים 💪`,
-      `🌊 שתה מים עכשיו! ${waterGoal}ml ביום 🎯`
-    ];
-    try { await sendWhatsApp(userId, msgs[Math.floor(Math.random() * msgs.length)]); }
-    catch (e) { console.error('Water reminder error:', e.message); }
+  const h = new Date().getHours();
+  if (h < 8 || h > 22) return;
+  const users = await getActiveUsers(24);
+  for (const user of users) {
+    const goal = user.profile?.waterGoal || 2500;
+    const msgs = [`💧 זמן לשתות! מטרה: ${goal}ml 🙏`, `💦 מים = אנרגיה! שתה עכשיו 💪`, `🌊 ${goal}ml ביום — שתית? 🎯`];
+    try { await sendWhatsApp(user.userId, msgs[Math.floor(Math.random() * msgs.length)]); }
+    catch (e) { console.error('Water error:', e.message); }
   }
 }, { timezone: 'Asia/Jerusalem' });
 
-// =================== CRON: תמונת גוף שבועית ראשון 9:00 ===================
+// 📸 תמונת גוף שבועית ראשון 9:00
 cron.schedule('0 9 * * 0', async () => {
-  for (const [userId, user] of Object.entries(users)) {
-    if (!user.lastActive) continue;
-    const h = (new Date() - new Date(user.lastActive)) / (1000 * 60 * 60);
-    if (h > 48) continue;
-    try {
-      await sendWhatsApp(userId,
-        `📸 הגיע הזמן לתמונת ההתקדמות השבועית!\n\nשלח תמונה בלי חולצה ואנתח:\n💪 אחוזי שומן\n📊 השוואה לשבוע שעבר\n🎯 המלצות לשיפור 🔥`
-      );
-    } catch (e) { console.error('Weekly photo error:', e.message); }
+  const users = await getActiveUsers(48);
+  for (const user of users) {
+    try { await sendWhatsApp(user.userId, `📸 תמונת התקדמות שבועית!\nשלח תמונה בלי חולצה → ניתוח אחוזי שומן + המלצות 🔥`); }
+    catch (e) { console.error('Body photo error:', e.message); }
   }
 }, { timezone: 'Asia/Jerusalem' });
+
+// =================== WEBHOOK VERIFY ===================
+app.get('/webhook', (req, res) => {
+  if (req.query['hub.mode'] === 'subscribe' && req.query['hub.verify_token'] === VERIFY_TOKEN) {
+    res.status(200).send(req.query['hub.challenge']);
+  } else { res.sendStatus(403); }
+});
 
 // =================== MAIN WEBHOOK ===================
 app.post('/webhook', async (req, res) => {
   res.sendStatus(200);
-
   try {
-    const entry = req.body.entry?.[0];
-    const value = entry?.changes?.[0]?.value;
+    const value = req.body.entry?.[0]?.changes?.[0]?.value;
     if (value?.statuses) return;
-
     const message = value?.messages?.[0];
     if (!message) return;
 
-    console.log('Message from', message.from, '| type:', message.type);
-
+    console.log('MSG from', message.from, '| type:', message.type);
     const userId = message.from;
-    const user = getUser(userId);
+    const user = await getUser(userId);
     user.lastActive = new Date();
 
     const today = new Date().toDateString();
     if (user.lastCheckIn !== today) {
-      user.streak += 1;
+      user.streak = (user.streak || 0) + 1;
       user.lastCheckIn = today;
       user.todayMeals = [];
       user.waterReminders = 0;
+      if (user.fitnessData) { user.fitnessData.todaySteps = 0; user.fitnessData.todayWorkoutMinutes = 0; user.fitnessData.todayWorkoutType = null; }
     }
 
     let reply = '';
 
-    // =================== תמונת גוף ===================
-    if (message.type === 'image' && user.pendingMeal === 'body_photo') {
-      const { base64, mimeType } = await downloadImage(message.image.id);
-      const p = user.profile;
-      reply = await callClaude([{
-        role: 'user',
-        content: [
-          { type: 'image', source: { type: 'base64', media_type: mimeType, data: base64 } },
-          { type: 'text', text: `אתה מקס — מאמן כושר. נתח גוף בתמונה.
-נתונים: גובה ${p.height || 'לא ידוע'}cm, משקל ${p.weight || 'לא ידוע'}kg, BMI ${p.bmi || 'לא חושב'}
-📊 אחוזי שומן: X% | 💪 סוג גוף: X | 🎯 אזורים לשיפור: X | ✅ מה טוב: X | 💡 המלצה: X` }
-        ]
-      }], null, 800);
+    // 🎤 קולי
+    if (message.type === 'audio') {
+      reply = `🎤 קיבלתי הודעה קולית!\nעדיין לומד לתמלל קול ישירות 😅\nכתוב לי בטקסט ואענה מיד! 💪`;
+
+    // 💪 תמונת גוף
+    } else if (message.type === 'image' && user.pendingMeal === 'body_photo') {
+      const { base64, mimeType } = await downloadMedia(message.image.id);
+      reply = await callClaude([{ role: 'user', content: [
+        { type: 'image', source: { type: 'base64', media_type: mimeType, data: base64 } },
+        { type: 'text', text: `מקס. נתח גוף. ${user.profile.height || '?'}cm, ${user.profile.weight || '?'}kg.\n📊 אחוזי שומן | 💪 סוג גוף | 🎯 לשיפור | ✅ טוב | 💡 המלצה. מעודד!` }
+      ]}], null, 600);
       user.pendingMeal = null;
 
-    // =================== תמונת בדיקת דם ===================
+    // 🔬 תמונת בדיקת דם
     } else if (message.type === 'image' && user.pendingMeal === 'blood_test_photo') {
-      const { base64, mimeType } = await downloadImage(message.image.id);
-      await sendWhatsApp(userId, `🔬 מנתח את בדיקות הדם שלך... רגע אחד!`);
-      const analysis = await callClaude([{
-        role: 'user',
-        content: [
-          { type: 'image', source: { type: 'base64', media_type: mimeType, data: base64 } },
-          { type: 'text', text: `אתה מקס — מנחה בריאות. קרא את ערכי בדיקת הדם מהתמונה ונתח אותם.
-פרופיל: גיל ${user.profile.age || 'לא ידוע'}, גובה ${user.profile.height || 'לא ידוע'}cm, משקל ${user.profile.weight || 'לא ידוע'}kg
-מחלות: ${user.medicalHistory.conditions.join(', ') || 'אין'} | תרופות: ${user.medicalHistory.medications.join(', ') || 'אין'}
-
-נתח לפי: ✅ תקין | ⚠️ גבולי | 🚨 חריג | 💊 חוסרים | 📈 עודפים | 🔗 שילובים חשודים | 🥗 המלצות תזונה
-⚕️ סיים עם תזכורת להתייעץ עם רופא` }
-        ]
-      }], null, 1500);
+      const { base64, mimeType } = await downloadMedia(message.image.id);
+      await sendWhatsApp(userId, `🔬 מנתח בדיקות דם... רגע!`);
+      reply = await callClaude([{ role: 'user', content: [
+        { type: 'image', source: { type: 'base64', media_type: mimeType, data: base64 } },
+        { type: 'text', text: `מקס. קרא ונתח בדיקות דם. גיל ${user.profile.age || '?'}, ${user.profile.height || '?'}cm.\n✅ תקין | ⚠️ גבולי | 🚨 חריג | 💊 חוסרים | 📈 עודפים | 🔗 שילובים | 🥗 המלצות | ⚕️ הפנה לרופא` }
+      ]}], null, 1400);
       user.medicalHistory.lastBloodTest = new Date().toISOString();
-      user.medicalHistory.bloodTests.push({ date: new Date().toISOString(), analysis: analysis.substring(0, 200) });
       user.pendingMeal = null;
-      reply = analysis;
 
-    // =================== תמונת אוכל ===================
+    // 🍽️ תמונת אוכל
     } else if (message.type === 'image') {
-      const { base64, mimeType } = await downloadImage(message.image.id);
-      const fullReply = await callClaude([{
-        role: 'user',
-        content: [
-          { type: 'image', source: { type: 'base64', media_type: mimeType, data: base64 } },
-          { type: 'text', text: `אתה מקס — מאמן תזונה. נתח אוכל בתמונה. אם יש יד — השתמש כקנה מידה.
+      const { base64, mimeType } = await downloadMedia(message.image.id);
+      const full = await callClaude([{ role: 'user', content: [
+        { type: 'image', source: { type: 'base64', media_type: mimeType, data: base64 } },
+        { type: 'text', text: `מקס — תזונה. נתח אוכל. יד = קנה מידה.
+🍽️ מה | 🔥 קלוריות | 💪 חלבון | 🍞 פחמימות | 🍬 סוכרים | 🥑 שומן
+🧂 ברזל,סידן,אשלגן,מגנזיום,ויטמין C,D,B12
+💡 טיפ | ❓ מדויק? תקן או "שמור"
+DATA:{"calories":0,"protein":0,"carbs":0,"fat":0,"sugar":0,"minerals":{"iron":0,"calcium":0,"potassium":0,"magnesium":0,"sodium":0,"zinc":0,"vitC":0,"vitD":0,"vitB12":0}}` }
+      ]}], null, 900);
+      const dm = full.match(/DATA:(\{.*?\})/s);
+      if (dm) { try { user.pendingMeal = { data: JSON.parse(dm[1]), time: new Date().toLocaleTimeString('he-IL') }; } catch (e) {} }
+      reply = full.replace(/DATA:\{.*?\}/s, '').trim();
 
-🍽️ מה אני רואה: X | 📏 קנה מידה: X
-🔥 קלוריות: ~X | 💪 חלבון: Xg | 🍞 פחמימות: Xg | 🍬 סוכרים: Xg | 🥑 שומן: Xg
-🧂 ברזל: Xmg | סידן: Xmg | אשלגן: Xmg | מגנזיום: Xmg | ויטמין C: Xmg | D: Xμg | B12: Xμg
-💡 טיפ: X
-❓ מדויק? לתקן — כתוב לי. בסדר — כתוב "שמור"
-
-DATA:{"calories":X,"protein":X,"carbs":X,"fat":X,"sugar":X,"minerals":{"iron":X,"calcium":X,"potassium":X,"magnesium":X,"sodium":X,"zinc":X,"vitC":X,"vitD":X,"vitB12":X}}` }
-        ]
-      }], null, 1000);
-
-      const dataMatch = fullReply.match(/DATA:(\{.*?\})/s);
-      if (dataMatch) {
-        try { user.pendingMeal = { data: JSON.parse(dataMatch[1]), time: new Date().toLocaleTimeString('he-IL') }; }
-        catch (e) { console.error('Meal parse error:', e.message); }
-      }
-      reply = fullReply.replace(/DATA:\{.*?\}/s, '').trim();
-
-    // =================== טקסט ===================
+    // 💬 טקסט
     } else if (message.type === 'text') {
-      const userMsg = message.text.body.trim();
-      console.log('Text:', userMsg.substring(0, 80));
+      const msg = message.text.body.trim();
+      const fitnessUpdated = parseFitness(msg, user);
 
-      // ===== שמירת ארוחה =====
-      if (userMsg === 'שמור' || userMsg.toLowerCase() === 'save') {
-        if (user.pendingMeal && user.pendingMeal.data) {
-          user.todayMeals.push(user.pendingMeal);
-          user.pendingMeal = null;
-          reply = `✅ נשמר! ${user.todayMeals.length} ארוחות היום.\nשלח "דוח יומי" לסיכום 📊`;
-        } else {
-          reply = `אין ארוחה ממתינה 😅`;
-        }
+      if (msg === 'שמור' || msg.toLowerCase() === 'save') {
+        if (user.pendingMeal?.data) {
+          user.todayMeals.push(user.pendingMeal); user.pendingMeal = null;
+          reply = `✅ נשמר! ${user.todayMeals.length} ארוחות היום. שלח "דוח יומי" לסיכום 📊`;
+        } else { reply = `אין ארוחה ממתינה 😅`; }
 
-      // ===== היסטוריה רפואית =====
-      } else if (userMsg.includes('בריא לחלוטין') || userMsg.includes('אין מחלות')) {
+      } else if (msg.includes('כושר שלי') || msg.includes('סטטוס')) {
+        reply = fitnessBar(user) + `\n\n💡 לדווח: "עשיתי 8,000 צעדים" / "אימון של 45 דקות"`;
+
+      } else if (fitnessUpdated) {
+        const fd = user.fitnessData;
+        reply = await callClaude([{ role: 'user', content: `מקס. תגיב לדיווח כושר. צעדים: ${fd.todaySteps}, אימון: ${fd.todayWorkoutMinutes} דקות, רצף: ${user.streak}. קצר + מעודד + שאלה.` }], null, 170);
+
+      } else if (msg.includes('בריא לחלוטין') || msg.includes('אין מחלות')) {
         user.medicalHistory.medicalAsked = true;
-        reply = `✅ מעולה! רשמתי שאתה בריא לחלוטין.\nעכשיו אני יכול לתת לך המלצות ללא מגבלות 💪\n\nמה נעבוד עליו היום?`;
+        reply = `✅ מושלם — בריא לחלוטין! 💪\nאין מגבלות — נתחיל לעבוד! מה המטרה הראשונה? 🔥`;
 
-      } else if (
-        user.medicalHistory.medicalAsked === false &&
-        user.history.length >= 8 &&
-        !userMsg.includes('אתגר') &&
-        !userMsg.includes('תוכנית')
-      ) {
-        // שואלים היסטוריה רפואית אחרי מספיק שיחה
+      } else if (!user.medicalHistory.medicalAsked && user.history.length >= 8) {
         user.medicalHistory.medicalAsked = true;
-        reply = getMedicalHistoryQuestion();
+        reply = `🏥 שאלה חשובה לייעוץ מדויק:\n1. מחלות כרוניות?\n2. תרופות?\n3. אלרגיות?\n\nכתוב הכל 🔒 | אין? "בריא לחלוטין"\n⚠️ אני מנחה — לא רופא`;
 
-      // ===== ניתוח בדיקת דם (טקסט) =====
-      } else if (
-        userMsg.includes('בדיקת דם') ||
-        userMsg.includes('תוצאות בדיקה') ||
-        userMsg.includes('ניתוח בדיקה')
-      ) {
-        // בודק אם זה טקסט עם ערכים או בקשה לשלוח תמונה
-        if (userMsg.length > 50) {
-          // יש ערכים בטקסט — נתח
-          await sendWhatsApp(userId, `🔬 מנתח את הבדיקות... רגע!`);
-          const analysis = await analyzeBloodTest(userMsg, user.profile, user.medicalHistory);
-          user.medicalHistory.lastBloodTest = new Date().toISOString();
-          reply = analysis;
+      } else if (msg.includes('בדיקת דם') || msg.includes('תוצאות בדיקה')) {
+        if (msg.length > 60) {
+          await sendWhatsApp(userId, `🔬 מנתח... רגע!`);
+          reply = await analyzeBloodTest(msg, user.profile, user.medicalHistory);
         } else {
-          // בקשה כללית — שאל איך לשלוח
           user.pendingMeal = 'blood_test_photo';
-          reply = `🔬 מעולה! יש 2 אפשרויות:\n\n1️⃣ שלח **תמונה** של הדף עם תוצאות הבדיקה\n2️⃣ **הקלד** את הערכים בפורמט:\nהמוגלובין: 14.2\nויטמין D: 18\nB12: 320\n...וכו׳\n\nאנתח הכל ואגיד לך מה מצוין, מה גבולי ומה דורש תשומת לב 🎯`;
+          reply = `🔬 2 אפשרויות:\n1️⃣ שלח **תמונה** של הבדיקה\n2️⃣ **הקלד** ערכים:\nויטמין D: 18\nB12: 320\nהמוגלובין: 14.2`;
         }
 
-      // ===== יוטיוב כושר =====
       } else if (
-        userMsg.includes('סרטון') ||
-        userMsg.includes('יוטיוב') ||
-        userMsg.includes('youtube') ||
-        userMsg.includes('להראות לי')
+        msg.includes('סרטון') || msg.includes('יוטיוב') || msg.toLowerCase().includes('youtube') ||
+        msg.includes('איך עושים') || msg.includes('איך מתאמן') || msg.includes('תרגיל ל')
       ) {
-        const isHealth = ['ויטמין', 'הורמון', 'ביוהאקינג', 'שינה', 'לחץ', 'אינסולין'].some(w => userMsg.includes(w));
-        const topic = userMsg.replace(/סרטון|יוטיוב|youtube|על|של|להראות לי/gi, '').trim() || 'כושר כללי';
+        const isHealth = ['ויטמין', 'הורמון', 'ביוהאקינג', 'שינה', 'אינסולין', 'קורטיזול'].some(w => msg.includes(w));
+        const topic = msg.replace(/סרטון|יוטיוב|youtube|על|של|איך עושים|איך מתאמן|תרגיל ל|להראות/gi, '').trim() || 'כושר';
+        await sendWhatsApp(userId, `🔍 מחפש ביוטיוב... רגע!`);
         reply = await getYouTubeRecommendations(topic, isHealth ? 'health' : 'exercise');
 
-      // ===== בקשת המלצת יוטיוב לתרגיל ספציפי =====
-      } else if (
-        userMsg.includes('איך עושים') ||
-        userMsg.includes('תרגיל ל') ||
-        userMsg.includes('איך מתאמן')
-      ) {
-        const topic = userMsg.replace(/איך עושים|תרגיל ל|איך מתאמן/gi, '').trim();
-        reply = await getYouTubeRecommendations(topic, 'exercise');
-
-      // ===== השלמת אתגר =====
-      } else if (userMsg.includes('השלמתי אתגר') || userMsg.includes('סיימתי אתגר')) {
+      } else if (msg.includes('השלמתי אתגר') || msg.includes('סיימתי אתגר')) {
         if (user.weeklyChallenge && !user.challengeCompleted) {
-          user.challengeCompleted = true;
-          user.streak += 1;
-          reply = await callClaude([{
-            role: 'user',
-            content: `מקס חוגג! המשתמש${user.profile.name ? ` ${user.profile.name}` : ''} השלים אתגר שבועי! רצף: ${user.streak} ימים.
-🎉 חגיגה גדולה + 🏆 רצף + ⭐ אתגר בונוס קטן. קצר ואנרגטי!`
-          }], null, 300);
-        } else if (user.challengeCompleted) {
-          reply = `כבר השלמת השבוע — אתה אלוף! 🏆\nהאתגר הבא — ביום ראשון 💪`;
+          user.challengeCompleted = true; user.streak += 1;
+          reply = await callClaude([{ role: 'user', content: `מקס חוגג! ${user.profile.name || ''} השלים אתגר! רצף: ${user.streak}. 🎉 חגיגה + 🏆 + ⭐ בונוס. קצר!` }], null, 200);
         } else {
-          reply = `עדיין אין לך אתגר שבועי 😅\nשלח "אתגר שבועי" ואייצר לך אחד!`;
+          reply = user.challengeCompleted ? `כבר השלמת — אלוף! 🏆 הבא ביום ראשון 💪` : `אין אתגר עדיין 😅 שלח "אתגר שבועי"!`;
         }
 
-      // ===== אתגר שבועי =====
-      } else if (userMsg.includes('אתגר שבועי') || userMsg.includes('אתגר')) {
-        const challenge = await generateWeeklyChallenge(user);
-        user.weeklyChallenge = challenge;
-        user.challengeCompleted = false;
-        reply = challenge;
+      } else if (msg.includes('אתגר שבועי') || (msg.includes('אתגר') && !msg.includes('השלמתי'))) {
+        const ch = await generateChallenge(user); user.weeklyChallenge = ch; user.challengeCompleted = false; reply = ch;
 
-      // ===== תוכנית אימונים =====
-      } else if (
-        userMsg.includes('תוכנית אימונים') ||
-        userMsg.includes('תוכנית כושר') ||
-        userMsg.includes('אימון שבועי')
-      ) {
-        await sendWhatsApp(userId, `💪 בונה תוכנית אימונים מותאמת אישית... 🔥`);
-        user.workoutPlan = await generateWorkoutPlan(user);
-        reply = user.workoutPlan;
+      } else if (msg.includes('תוכנית אימונים') || msg.includes('תוכנית כושר') || msg.includes('אימון שבועי')) {
+        await sendWhatsApp(userId, `💪 בונה תוכנית אישית... 🔥`);
+        user.workoutPlan = await generateWorkoutPlan(user); reply = user.workoutPlan;
 
-      // ===== ציטוט מוטיבציה =====
-      } else if (userMsg.includes('ציטוט') || userMsg.includes('מוטיבציה')) {
-        reply = await callClaude([{
-          role: 'user',
-          content: `מקס. ציטוט מוטיבציה קצר. רצף: ${user.streak} ימים.\n💬 "[ציטוט]"\n— [מחבר]\n🔥 [משפט ממקס]`
-        }], null, 200);
+      } else if (msg.includes('ציטוט') || msg.includes('מוטיבציה')) {
+        reply = await callClaude([{ role: 'user', content: `מקס. ציטוט מוטיבציה. רצף: ${user.streak}.\n💬 "[ציטוט]" — [מחבר]\n🔥 [ממקס]. 3 שורות.` }], null, 130);
 
-      // ===== דוח יומי =====
-      } else if (userMsg.includes('דוח יומי') || userMsg.toLowerCase().includes('daily report')) {
-        const report = generateDailyReport(user.todayMeals);
-        if (!report || report.mealCount === 0) {
-          reply = `😅 עוד לא שלחת תמונות אוכל היום.\nשלח תמונה של הארוחה הבאה! 📸`;
+      } else if (msg.includes('דוח יומי') || msg.toLowerCase().includes('daily report')) {
+        const report = buildDailyReport(user.todayMeals);
+        if (!report) {
+          reply = `😅 עוד לא שלחת תמונות אוכל.\n${fitnessBar(user)}\nשלח תמונת אוכל! 📸`;
         } else {
-          reply = await callClaude([{
-            role: 'user',
-            content: `מקס. דוח יומי מעודד:
-${report.mealCount} ארוחות | ${report.totalCalories} קק"ל | חלבון: ${report.totalProtein}g | פחמימות: ${report.totalCarbs}g | שומן: ${report.totalFat}g | סוכר: ${report.totalSugar}g
-מים: ${user.profile?.waterGoal || 2500}ml | מינרלים: ${Object.entries(report.minerals).map(([k,v]) => `${k}:${v}`).join(', ')}
-סיכום + מה טוב + מה חסר + המלצות + ציון מ-10. קצר ומעודד!`
-          }], null, 800);
+          reply = await callClaude([{ role: 'user', content: `מקס. דוח יומי:\n${report.mealCount} ארוחות | ${report.calories}kcal | חלבון: ${report.protein}g | פחמימות: ${report.carbs}g | שומן: ${report.fat}g\n${user.fitnessData.todaySteps} צעדים | ${user.fitnessData.todayWorkoutMinutes} דקות\nמינרלים: ${Object.entries(report.minerals || {}).map(([k,v]) => `${k}:${v}`).join(', ')}\nסיכום + טוב + חסר + המלצות + ציון/10. קצר!` }], null, 600);
         }
 
-      // ===== תמונת גוף =====
-      } else if (userMsg.includes('תמונת גוף') || userMsg.includes('אחוזי שומן')) {
-        user.pendingMeal = 'body_photo';
-        reply = `💪 שלח תמונה בלי חולצה ואנתח:\n- אחוזי שומן\n- סוג גוף\n- המלצות אישיות\nאור טוב ותמונה ברורה! 📸`;
+      } else if (msg.includes('תמונת גוף') || msg.includes('אחוזי שומן')) {
+        user.pendingMeal = 'body_photo'; reply = `💪 שלח תמונה בלי חולצה — אנתח אחוזי שומן! 📸`;
 
-      // ===== תיקון ארוחה =====
-      } else if (user.pendingMeal && user.pendingMeal.data) {
-        const corrReply = await callClaude([{
-          role: 'user',
-          content: `מקס. תקן נתוני ארוחה.
-נתונים: ${JSON.stringify(user.pendingMeal.data)}
-תיקון: "${userMsg}"
-תן תשובה + DATA:{"calories":X,"protein":X,"carbs":X,"fat":X,"sugar":X,"minerals":{"iron":X,"calcium":X,"potassium":X,"magnesium":X,"sodium":X,"zinc":X,"vitC":X,"vitD":X,"vitB12":X}}`
-        }], null, 600);
-        const dataMatch = corrReply.match(/DATA:(\{.*?\})/s);
-        if (dataMatch) {
-          try { user.pendingMeal.data = JSON.parse(dataMatch[1]); } catch (e) {}
-        }
-        reply = corrReply.replace(/DATA:\{.*?\}/s, '').trim();
+      } else if (user.pendingMeal?.data) {
+        const cr = await callClaude([{ role: 'user', content: `מקס. תקן ארוחה: ${JSON.stringify(user.pendingMeal.data)}. תיקון: "${msg}". תשובה + DATA:{...}` }], null, 400);
+        const dm = cr.match(/DATA:(\{.*?\})/s);
+        if (dm) { try { user.pendingMeal.data = JSON.parse(dm[1]); } catch (e) {} }
+        reply = cr.replace(/DATA:\{.*?\}/s, '').trim();
 
-      // ===== שיחה רגילה =====
       } else {
-        user.history.push({ role: 'user', content: userMsg });
-        if (user.history.length > 30) user.history = user.history.slice(-30);
+        // ===== שיחה רגילה עם זיכרון מלא =====
+        await addToHistory(user, 'user', msg);
+        const { summaryText, recentHistory } = buildContext(user);
 
-        const systemWithState = MAX_PERSONALITY + `\n\n📊 מצב:
-- שם: ${user.profile.name || 'לא ידוע'} | גיל: ${user.profile.age || 'לא ידוע'}
-- רצף: ${user.streak} ימים | יום היכרות: ${user.onboardingDay}
-- גובה: ${user.profile.height || '?'} | משקל: ${user.profile.weight || '?'} | BMI: ${user.profile.bmi || '?'}
-- מים: ${user.profile.waterGoal || '?'}ml | ארוחות היום: ${user.todayMeals.length}
-- מחלות: ${user.medicalHistory.conditions.join(', ') || 'אין'} | תרופות: ${user.medicalHistory.medications.join(', ') || 'אין'}
-- היסטוריה רפואית נשאלה: ${user.medicalHistory.medicalAsked}
-- אתגר פעיל: ${user.weeklyChallenge ? 'כן' : 'לא'} | הושלם: ${user.challengeCompleted}`;
+        const system = MAX_PERSONALITY + `\n\n${summaryText ? summaryText + '\n\n' : ''}📊 מצב נוכחי:
+שם: ${user.profile.name || '?'} | גיל: ${user.profile.age || '?'} | רצף: ${user.streak} ימים
+גובה: ${user.profile.height || '?'} | משקל: ${user.profile.weight || '?'} | BMI: ${user.profile.bmi || '?'}
+מים: ${user.profile.waterGoal || '?'}ml | ארוחות: ${user.todayMeals.length}
+צעדים: ${user.fitnessData?.todaySteps || 0} | אימון: ${user.fitnessData?.todayWorkoutMinutes || 0} דקות
+מחלות: ${user.medicalHistory.conditions.join(', ') || 'אין'} | אתגר: ${user.weeklyChallenge ? 'פעיל' : 'אין'}`;
 
-        let aiReply = await callClaude(user.history, systemWithState, 1000);
+        let aiReply = await callClaude(recentHistory, system, 1000);
 
-        // שמירת BMI
-        const bmiMatch = aiReply.match(/\[SAVE_BMI:(\d+(?:\.\d+)?):(\d+(?:\.\d+)?)\]/);
-        if (bmiMatch) {
-          const height = parseFloat(bmiMatch[1]);
-          const weight = parseFloat(bmiMatch[2]);
-          const { bmi, status, waterGoal } = calculateBMI(height, weight);
-          user.profile = { ...user.profile, height, weight, bmi, waterGoal };
-          aiReply = aiReply.replace(bmiMatch[0], '').trim();
-          aiReply += `\n\n📊 BMI: ${bmi} (${status})\n💧 מים ביום: ${waterGoal}ml`;
+        // שמירת פרטים אוטומטית
+        const bmiM = aiReply.match(/\[SAVE_BMI:(\d+(?:\.\d+)?):(\d+(?:\.\d+)?)\]/);
+        if (bmiM) {
+          const { bmi, status, waterGoal } = calculateBMI(parseFloat(bmiM[1]), parseFloat(bmiM[2]));
+          user.profile = { ...user.profile, height: parseFloat(bmiM[1]), weight: parseFloat(bmiM[2]), bmi, waterGoal };
+          aiReply = aiReply.replace(bmiM[0], '').trim() + `\n\n📊 BMI: ${bmi} (${status}) | 💧 מים: ${waterGoal}ml/יום`;
         }
+        const nameM = aiReply.match(/\[SAVE_NAME:([^\]]+)\]/);
+        if (nameM) { user.profile.name = nameM[1].trim(); aiReply = aiReply.replace(nameM[0], '').trim(); }
+        const ageM = aiReply.match(/\[SAVE_AGE:(\d+)\]/);
+        if (ageM) { user.profile.age = parseInt(ageM[1]); aiReply = aiReply.replace(ageM[0], '').trim(); }
 
-        // שמירת שם
-        const nameMatch = aiReply.match(/\[SAVE_NAME:([^\]]+)\]/);
-        if (nameMatch) {
-          user.profile.name = nameMatch[1].trim();
-          aiReply = aiReply.replace(nameMatch[0], '').trim();
-        }
-
-        // שמירת גיל
-        const ageMatch = aiReply.match(/\[SAVE_AGE:(\d+)\]/);
-        if (ageMatch) {
-          user.profile.age = parseInt(ageMatch[1]);
-          aiReply = aiReply.replace(ageMatch[0], '').trim();
-        }
-
-        // רישום מידע רפואי מהשיחה
-        if (userMsg.match(/לוקח|אני עם|יש לי|סובל מ|אלרגי/)) {
-          user.medicalHistory.medicalAsked = true;
-        }
-
-        // הוספת רמז יכולת חדשה
-        const capHint = getCapabilityHint(userMsg, user);
-        if (capHint) aiReply += capHint;
-
+        aiReply += capabilityHint(msg, user);
         reply = aiReply;
-        user.history.push({ role: 'assistant', content: reply });
+        await addToHistory(user, 'assistant', reply);
 
         if (user.onboardingDay < 3 && user.history.length > 6) {
           user.onboardingDay = Math.min(3, Math.floor(user.history.length / 6) + 1);
         }
       }
-
     } else {
-      reply = `סוג הודעה לא נתמך 😅 שלח טקסט או תמונה!`;
+      reply = `סוג הודעה לא נתמך 😅 שלח טקסט, תמונה, או הודעה קולית!`;
     }
 
     if (reply) await sendWhatsApp(userId, reply);
+    await saveUser(user);
 
   } catch (err) {
     console.error('Webhook error:', err.response?.data || err.message);
   }
 });
 
-app.get('/', (req, res) => res.send('מקס פועל! 🚀'));
+app.get('/', (req, res) => res.json({
+  status: '🚀 מקס פועל!',
+  mongodb: !!usersCollection,
+  youtube: !!YOUTUBE_API_KEY,
+  users: Object.keys(memoryCache).length
+}));
 
-app.listen(process.env.PORT || 3000, () => {
-  console.log('🚀 מקס פועל על פורט', process.env.PORT || 3000);
-  console.log('PHONE_NUMBER_ID:', PHONE_NUMBER_ID);
-  console.log('WA_TOKEN set:', !!WA_TOKEN);
-  console.log('ANTHROPIC_API_KEY set:', !!ANTHROPIC_API_KEY);
+connectDB().then(() => {
+  app.listen(process.env.PORT || 3000, () => {
+    console.log('🚀 מקס פועל!');
+    console.log('MongoDB:', !!MONGODB_URI);
+    console.log('YouTube API:', !!YOUTUBE_API_KEY);
+    console.log('WhatsApp:', !!WA_TOKEN);
+  });
 });
