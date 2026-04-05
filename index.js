@@ -575,8 +575,16 @@ LIST MANAGEMENT:
 When you give a supplement/food list, remember it. If user asks to add/remove items, update the full list and show it complete with all changes.
 
 PROACTIVE SHOPPING:
-After giving supplement recommendations, ALWAYS offer shopping links:
-"רוצה קישורי קנייה ל-iHerb לכל התוספים?" / "Want iHerb links for all these?"
+After giving supplement recommendations, offer links AS TEXT ONLY — no URLs:
+Say: "רוצה קישורי קנייה ל-iHerb? כתוב קישורי קנייה" / "Want iHerb links? Say shopping links"
+NEVER include actual URLs or iherb.com links unless user explicitly asks.
+
+SUPPLEMENT RULES — CRITICAL:
+1. Always recommend from the approved supplement list in your knowledge base. Never invent supplements not listed there.
+2. Be CONSISTENT — same goal = same supplements every time.
+3. ALWAYS add disclaimer when discussing supplements:
+   Hebrew: "אני לא רופא — המידע הוא בגדר המלצה בלבד. התייעץ עם רופא לפני נטילת תוספים."
+   English: "I am not a doctor — all info is educational only. Consult your doctor before taking supplements."
 
 REPLY AWARENESS:
 If user replies to a specific message, address that specific content directly.
@@ -604,28 +612,38 @@ Respond in: ${lang}`
 }
 
 async function getSupplementStack(goal, user, lang) {
+  const isHeb = lang === 'hebrew';
   const result = await callClaude([{
     role: 'user',
     content: `Max v4. Supplement stack for: "${goal}".
 User: age ${user.profile?.age || '?'}, conditions: ${user.medicalHistory?.conditions?.join(', ') || 'none'}
 
-For each supplement:
-💊 [Name] | [Dose + timing] | [Mechanism] | [Evidence: strong/moderate/emerging] | [Source: which biohacker]
+STRICT RULES:
+- Use ONLY supplements from this approved list. Do NOT invent others:
+  GROUP 1 (core): Magnesium Glycinate 300-400mg/night | Vitamin D3+K2 2000-5000IU/morning with fat | Zinc 15mg with food (+ Copper 1.5mg) | Omega-3 EPA+DHA 1000-2000mg/morning | Creatine 5g/day
+  GROUP 2 (testosterone/hormonal): Boron 3-10mg/morning (cycle 2 weeks on/1 week off) | Vitamin B6 as P5P 20-50mg/morning | Tongkat Ali 400mg/day (cycle) | Fadogia Agrestis 600mg/day (cycle)
+  GROUP 3 (stress/cortisol): Ashwagandha KSM-66 300-600mg | Reishi per product label evening
+  GROUP 4 (longevity): NMN 500-1000mg/morning | CoQ10 100-200mg/morning with fat | Alpha Lipoic Acid 600mg | Resveratrol 500mg with fat
+  GROUP 5 (anti-inflammatory): Nano-liposomal Curcumin 500-1000mg after meal | Vitamin E 100-200IU/morning
+  GROUP 6 (cognitive): Lions Mane 1000mg | L-Theanine 200mg | Alpha-GPC 300mg
+- Give EXACTLY the same supplements every time for the same goal
+- NO shopping links, NO URLs, NO iHerb links in this response
+- Always end with the disclaimer
 
-Format each supplement on its own line starting with 💊
-Add: ⚠️ dangerous combinations warning
-⚕️ consult doctor disclaimer
+Format each supplement:
+💊 [Name] | [Exact dose + timing] | [Why it helps for this goal] | [Evidence level]
+
+After the list add:
+⚠️ Dangerous combinations: list relevant ones
+⚕️ ${isHeb ? 'אני לא רופא — כל המידע הוא בגדר המלצה בלבד. התייעץ עם רופא לפני נטילת תוספים, במיוחד אם אתה נוטל תרופות.' : 'I am not a doctor — all information is for educational purposes only. Consult your doctor before taking supplements, especially if on medication.'}
+
 Respond in: ${lang}`
-  }], null, 800);
+  }], null, 900);
 
-  // חלץ תוספים והוסף קישורי קנייה
-  const supplements = await extractSupplementsFromText(result);
-  if (supplements.length > 0) {
-    const links = buildMultipleShoppingLinks(supplements, lang);
-    const isHeb = lang === 'hebrew';
-    return result + '\n\n' + links + '\n\n' + (isHeb ? '💡 לחץ על הקישורים לקנייה ישירה ב-iHerb' : '💡 Click links to buy directly on iHerb');
-  }
-  return result;
+  const disclaimer = isHeb
+    ? '\n\n💡 רוצה קישורי קנייה ל-iHerb? כתוב "קישורי קנייה"'
+    : '\n\n💡 Want iHerb shopping links? Say "shopping links"';
+  return result + disclaimer;
 }
 
 async function extractSupplementsFromText(text) {
@@ -1225,15 +1243,29 @@ async function processAIReply(aiReply, user, originalMsg, lang) {
   const ageM = aiReply.match(/\[SAVE_AGE:(\d+)\]/);
   if (ageM) { user.profile.age = parseInt(ageM[1]); aiReply = aiReply.replace(ageM[0], '').trim(); }
 
-  // אם התשובה מכילה תוספים — הצע קישורי קנייה
   const isHeb = lang === 'hebrew';
   const msgLower = originalMsg.toLowerCase();
-  const talkingAboutSupplements = ['תוסף', 'ויטמין', 'מגנזיום', 'supplement', 'vitamin', 'magnesium', 'omega', 'nmn', 'creatine'].some(w => msgLower.includes(w) || aiReply.toLowerCase().includes(w));
 
-  if (talkingAboutSupplements && !aiReply.includes('iherb.com')) {
+  // אם המשתמש ביקש במפורש קישורים — אל תוסיף כלום (כבר טופל בhandler)
+  const explicitlyAskedLinks = msgLower.includes('iherb') || msgLower.includes('איהרב') ||
+    msgLower.includes('קישורי קנייה') || msgLower.includes('shopping links') || msgLower.includes('לקנות');
+
+  const talkingAboutSupplements = ['תוסף', 'ויטמין', 'מגנזיום', 'supplement', 'vitamin', 'magnesium',
+    'omega', 'nmn', 'creatine', 'zinc', 'boron', 'curcumin', 'כורכומין', 'tongkat', 'אשווגנדה', 'ashwagandha'
+  ].some(w => msgLower.includes(w) || aiReply.toLowerCase().includes(w));
+
+  // הוסף disclaimer על ויטמינים — תמיד, בלי קישורים אוטומטיים
+  if (talkingAboutSupplements && !aiReply.includes('לא רופא') && !aiReply.includes('not a doctor')) {
     aiReply += isHeb
-      ? `\n\n💡 רוצה קישורי קנייה ל-iHerb לכל התוספים? כתוב "קישורי קנייה"`
-      : `\n\n💡 Want iHerb shopping links for all supplements? Say "shopping links"`;
+      ? `\n\n⚕️ תזכורת: אני לא רופא — המידע הוא בגדר המלצה בלבד. התייעץ עם רופא לפני שינוי תוספים.`
+      : `\n\n⚕️ Reminder: I am not a doctor — all info is for educational purposes only. Consult your doctor before changing supplements.`;
+  }
+
+  // הצע קישורים רק אם לא ביקשו אותם כבר ולא קיימים בתשובה
+  if (talkingAboutSupplements && !explicitlyAskedLinks && !aiReply.includes('iherb.com')) {
+    aiReply += isHeb
+      ? `\n\n💡 רוצה קישורי קנייה ל-iHerb? כתוב "קישורי קנייה"`
+      : `\n\n💡 Want iHerb shopping links? Say "shopping links"`;
   }
 
   return aiReply;
