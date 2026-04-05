@@ -53,7 +53,16 @@ async function getUser(userId) {
     lastActive: null, waterReminders: 0, weeklyChallenge: null, challengeCompleted: false,
     workoutPlan: null, shownCapabilities: [],
     proactive: { lastRandomMessage: null, randomMessageCount: 0 },
-    currentLists: {}  // שמירת רשימות פעילות (תוספים, מאכלים וכו׳)
+    currentLists: {},  // שמירת רשימות פעילות (תוספים, מאכלים וכו׳)
+    personalPlan: {
+      supplements: [],      // רשימת תוספים אישית
+      protocols: [],        // פרוטוקולים אישיים
+      goals: [],            // מטרות
+      restrictions: [],     // אלרגיות / מגבלות
+      lastUpdated: null,
+      hormonalScore: null,  // ניקוד שאלון אחרון
+      hormonalScoreDate: null
+    }
   };
   memoryCache[userId] = newUser;
   await saveUser(newUser);
@@ -600,6 +609,173 @@ Day 3: what hasn't worked, obstacles, time available
 Always connect to longevity. First message: greeting + ask name!
 ⚕️ Never recommend prescription drugs. Always suggest consulting doctor.`;
 
+
+// =================== PERSONAL PLAN ===================
+function buildUserContext(user) {
+  const p = user.profile || {};
+  const m = user.medicalHistory || {};
+  const f = user.fitnessData || {};
+  const plan = user.personalPlan || {};
+  return `
+USER PROFILE:
+Name: ${p.name || 'Unknown'} | Age: ${p.age || '?'} | Height: ${p.height || '?'}cm | Weight: ${p.weight || '?'}kg | BMI: ${p.bmi || '?'}
+Goals: ${p.goals?.join(', ') || 'not set'}
+Conditions: ${m.conditions?.join(', ') || 'none'}
+Medications: ${m.medications?.join(', ') || 'none'}
+Allergies: ${m.allergies?.join(', ') || 'none'}
+Last blood test: ${m.lastBloodTest || 'none'}
+Steps today: ${f.todaySteps || 0} | Workout today: ${f.todayWorkoutMinutes || 0} min | Streak: ${user.streak || 0} days
+Hormonal score: ${plan.hormonalScore ? `${plan.hormonalScore}/105 (${plan.hormonalScoreDate})` : 'not assessed'}
+Current supplement plan: ${plan.supplements?.length > 0 ? plan.supplements.join(', ') : 'none set'}
+Current protocols: ${plan.protocols?.length > 0 ? plan.protocols.join(', ') : 'none set'}
+`.trim();
+}
+
+async function getPersonalPlan(user, lang) {
+  const isHeb = lang === 'hebrew';
+  const plan = user.personalPlan || {};
+  const context = buildUserContext(user);
+
+  if (!plan.supplements?.length && !plan.protocols?.length) {
+    return isHeb
+      ? `📋 *התוכנית האישית שלך*
+
+עדיין לא בנינו תוכנית אישית! 🔍
+
+כדי לבנות תוכנית מדויקת, שלח:
+• 🧬 "בנה לי תוכנית" — ואנתח את כל הנתונים שלך
+• 📋 "שאלון הורמונלי" — להערכת המצב הנוכחי
+• 🩸 "בדיקת דם" + התוצאות שלך`
+      : `📋 *Your Personal Plan*
+
+No personal plan built yet! 🔍
+
+To build your plan, send:
+• 🧬 "Build my plan" — I'll analyze all your data
+• 📋 "Hormonal questionnaire" — assess current status
+• 🩸 "Blood test" + your results`;
+  }
+
+  return await callClaude([{ role: 'user', content: `Max v4. Display this user's complete personal biohacking plan in a clear, organized format.
+
+${context}
+
+Format:
+👤 *[Name]'s Personal Protocol*
+━━━━━━━━━━━━━━━
+🎯 *Goals:* [list]
+━━━━━━━━━━━━━━━
+💊 *Supplement Stack:*
+[each supplement with dose + timing]
+━━━━━━━━━━━━━━━
+🔬 *Daily Protocols:*
+[each protocol]
+━━━━━━━━━━━━━━━
+📊 *Hormonal Score:* [score if available]
+━━━━━━━━━━━━━━━
+⚕️ Not a doctor — consult physician before changes.
+
+Respond in: ${lang}` }], null, 800);
+}
+
+async function buildPersonalPlan(user, lang) {
+  const context = buildUserContext(user);
+  const isHeb = lang === 'hebrew';
+
+  const result = await callClaude([{ role: 'user', content: `Max v4. Build a PERSONALIZED biohacking protocol based on this user's exact data.
+
+${context}
+
+RULES:
+- Only use supplements from the approved list in your knowledge base
+- Tailor everything to their age, BMI, conditions, goals
+- If data is missing, note what's needed for better personalization
+- Be specific: exact doses, exact timing, exact protocols
+
+Format:
+🎯 *Primary Goals Identified:* [based on their data]
+━━━━━━━━━━━━━━━
+💊 *Personalized Supplement Stack:*
+💊 [Name] | [dose] | [timing] | [why specifically for THIS user]
+━━━━━━━━━━━━━━━
+🔬 *Daily Protocol:*
+🌅 Morning: [specific actions]
+🌞 Afternoon: [specific actions]
+🌙 Evening: [specific actions]
+━━━━━━━━━━━━━━━
+🏋️ *Training Protocol:* [based on their fitness data]
+━━━━━━━━━━━━━━━
+🥗 *Nutrition Focus:* [based on their profile]
+━━━━━━━━━━━━━━━
+⚠️ *Watch out for:* [based on conditions/medications]
+━━━━━━━━━━━━━━━
+📈 *Next steps to improve this plan:* [what data is still missing]
+⚕️ Disclaimer in ${lang}
+
+Respond in: ${lang}` }], null, 1200);
+
+  // שמור את התוכנית בפרופיל המשתמש
+  const supplements = await extractSupplementsFromText(result);
+  if (!user.personalPlan) user.personalPlan = { supplements: [], protocols: [], goals: [], restrictions: [], lastUpdated: null, hormonalScore: null, hormonalScoreDate: null };
+  if (supplements.length > 0) user.personalPlan.supplements = supplements;
+  user.personalPlan.lastUpdated = new Date().toISOString();
+
+  return result;
+}
+
+async function addToPersonalPlan(user, msg, lang) {
+  const isHeb = lang === 'hebrew';
+  if (!user.personalPlan) user.personalPlan = { supplements: [], protocols: [], goals: [], restrictions: [], lastUpdated: null, hormonalScore: null, hormonalScoreDate: null };
+
+  // חלץ מה להוסיף מהבקשה
+  const extracted = await callClaude([{ role: 'user', content: `Extract what the user wants to add to their supplement/protocol plan from this message: "${msg}".
+Current plan supplements: ${user.personalPlan.supplements?.join(', ') || 'none'}
+Return ONLY a JSON: {"supplements": ["name with dose"], "protocols": ["protocol description"], "goals": ["goal"]}
+Only include items actually mentioned. Return empty arrays if nothing relevant.` }], null, 200);
+
+  try {
+    const cleaned = extracted.replace(/\`\`\`json|\`\`\`/g, '').trim();
+    const parsed = JSON.parse(cleaned);
+
+    const added = [];
+    if (parsed.supplements?.length) {
+      for (const s of parsed.supplements) {
+        if (!user.personalPlan.supplements.includes(s)) {
+          user.personalPlan.supplements.push(s);
+          added.push(s);
+        }
+      }
+    }
+    if (parsed.protocols?.length) {
+      for (const p of parsed.protocols) {
+        if (!user.personalPlan.protocols.includes(p)) {
+          user.personalPlan.protocols.push(p);
+          added.push(p);
+        }
+      }
+    }
+    if (parsed.goals?.length) {
+      for (const g of parsed.goals) {
+        if (!user.personalPlan.goals.includes(g)) {
+          user.personalPlan.goals.push(g);
+        }
+      }
+    }
+    user.personalPlan.lastUpdated = new Date().toISOString();
+
+    if (added.length > 0) {
+      const list = user.personalPlan.supplements.map(s => `💊 ${s}`).join('\n');
+      return isHeb
+        ? `✅ הוספתי לתוכנית האישית שלך:\n${list}\n\n📋 כתוב "התוכנית שלי" לצפייה בתוכנית המלאה`
+        : `✅ Added to your personal plan:\n${list}\n\n📋 Say "my plan" to view your full plan`;
+    }
+  } catch(e) {}
+
+  return isHeb
+    ? `לא הצלחתי להבין מה להוסיף. נסה: "הוסף מגנזיום 400mg לפני שינה"`
+    : `Couldn't understand what to add. Try: "add Magnesium 400mg before sleep"`;
+}
+
 // =================== BIOHACKING PROTOCOLS ===================
 async function getBiohackingProtocol(topic, lang) {
   return await callClaude([{
@@ -1085,6 +1261,32 @@ Respond in: ${lang}` }
         const topic = msg.replace(/פרוטוקול|protocol|שגרת בוקר|morning protocol/gi, '').trim() || 'morning longevity protocol';
         reply = await getBiohackingProtocol(topic, lang);
 
+      // ===== תוכנית אישית =====
+      } else if (
+        msgLower.includes('התוכנית שלי') || msgLower.includes('my plan') ||
+        msgLower.includes('תראה לי את התוכנית') || msgLower.includes('show my plan') ||
+        msgLower.includes('הפרוטוקול שלי') || msgLower.includes('my protocol')
+      ) {
+        reply = await getPersonalPlan(user, lang);
+
+      // ===== בנה לי תוכנית =====
+      } else if (
+        msgLower.includes('בנה לי תוכנית') || msgLower.includes('build my plan') ||
+        msgLower.includes('תבנה תוכנית') || msgLower.includes('create my plan') ||
+        msgLower.includes('תוכנית אישית') || msgLower.includes('personal plan') ||
+        msgLower.includes('פרוטוקול אישי') || msgLower.includes('personal protocol')
+      ) {
+        await sendWhatsApp(userId, isHeb ? `🧬 מנתח את הנתונים שלך ובונה פרוטוקול אישי... ⏳` : `🧬 Analyzing your data and building personal protocol... ⏳`);
+        reply = await buildPersonalPlan(user, lang);
+
+      // ===== הוסף לתוכנית =====
+      } else if (
+        (msgLower.includes('הוסף') || msgLower.includes('תוסיף') || msgLower.includes('add') || msgLower.includes('include')) &&
+        (msgLower.includes('תוכנית') || msgLower.includes('plan') || msgLower.includes('תוסף') || msgLower.includes('supplement') || msgLower.includes('פרוטוקול') || msgLower.includes('protocol') ||
+        user.personalPlan?.supplements?.length > 0)
+      ) {
+        reply = await addToPersonalPlan(user, msg, lang);
+
       // ===== טסטוסטרון / הורמונים =====
       } else if (
         msgLower.includes('טסטוסטרון') || msgLower.includes('testosterone') ||
@@ -1108,14 +1310,121 @@ Respond in: ${lang}` }
         msgLower.includes('hormonal status') || msgLower.includes('hormonal assessment')
       ) {
         reply = isHeb
-          ? `📋 *שאלון 21 שאלות — מצב הורמונלי*\n\nדרג 1-3 כל שאלה:\n1️⃣ קם/קמה בבוקר עם אנרגיה?\n2️⃣ חשק מיני טבעי (בלי גירויים חיצוניים)?\n3️⃣ מוטיבציה פנימית לפעול?\n4️⃣ מתאמן/ת?\n5️⃣ מגיע לאימון עם אנרגיה?\n6️⃣ נותן 100% באימון?\n7️⃣ דינמיות לאורך היום?\n8️⃣ מתאושש/ת בקלות?\n9️⃣ אנרגיה יציבה (בלי נפילות)?\n🔟 אינטראקציות חברתיות שבועיות?\n1️⃣1️⃣ נמנע/ת מכלי פלסטיק?\n1️⃣2️⃣ מתמיד/ה בהרגלים?\n1️⃣3️⃣ חלבון איכותי בכל ארוחה?\n1️⃣4️⃣ נמנע/ת ממזון מעובד?\n1️⃣5️⃣ מקבל/ת החלטות בביטחון?\n1️⃣6️⃣ שינה עמוקה ומרעננת?\n1️⃣7️⃣ התלהבות יומית?\n1️⃣8️⃣ נמנע/ת מדאודורנטים מסחריים?\n1️⃣9️⃣ נמנע/ת מבגדים סינתטיים?\n2️⃣0️⃣ טלפון רחוק בשינה?\n2️⃣1️⃣ ישן/ה בחושך מוחלט?\n\n📊 *ניקוד:*\n21-30 → המערכת צועקת לעזרה 🆘\n31-45 → על הדרך, יש עבודה 💪\n46-63 → בסיס חזק, המשך! ✅\n\nשלח את הניקוד ואנתח! 🧬`
-          : `📋 *21-Question Hormonal Assessment*\n\nRate 1-3 each question:\n1️⃣ Wake up energized?\n2️⃣ Natural libido (no external stimulation)?\n3️⃣ Internal motivation to act?\n4️⃣ Exercise regularly?\n5️⃣ Arrive at workout energized?\n6️⃣ Give 100% at workout?\n7️⃣ Dynamic throughout day?\n8️⃣ Recover easily?\n9️⃣ Stable energy (no crashes)?\n🔟 Weekly social interactions?\n1️⃣1️⃣ Avoid plastic containers?\n1️⃣2️⃣ Stick to habits?\n1️⃣3️⃣ Quality protein each meal?\n1️⃣4️⃣ Avoid processed food?\n1️⃣5️⃣ Confident decisions?\n1️⃣6️⃣ Deep restorative sleep?\n1️⃣7️⃣ Daily enthusiasm?\n1️⃣8️⃣ Avoid commercial deodorants?\n1️⃣9️⃣ Avoid synthetic clothing?\n2️⃣0️⃣ Phone away during sleep?\n2️⃣1️⃣ Sleep in complete darkness?\n\n📊 *Score:*\n21-30 → System needs deep work 🆘\n31-45 → On the way, keep going 💪\n46-63 → Strong foundation! ✅\n\nSend your score and I'll analyze! 🧬`;
+          ? `🧬 *הערכה הורמונלית מדעית — 21 פרמטרים*
+
+*סולם: 1–5 לכל שאלה*
+1 = כמעט אף פעם | 3 = לפעמים | 5 = תמיד / באופן עקבי
+
+*🔋 אנרגיה ומנוע פנימי*
+1. עוצמת האנרגיה שלך בבוקר מיד עם ההשכמה?
+2. רמת המוטיבציה הפנימית לפעולה לאורך היום?
+3. יציבות האנרגיה — בלי נפילות אחר הצהריים?
+4. תחושת חיוניות ודינמיות כללית?
+
+*⚡ ביצועים גופניים*
+5. תדירות האימונים השבועית שלך?
+6. עוצמת המאמץ באימון (אחוז מהמקסימום שלך)?
+7. יכולת ההתאוששות לאחר אימון או תקופה עמוסה?
+8. כוח ועמידות שרירית בהשוואה לשנה שעברה?
+
+*🧠 תפקוד קוגניטיבי והורמונלי*
+9. חדות מחשבה, ריכוז וזיכרון?
+10. ביטחון בקבלת החלטות — בלי ספקות מיותרות?
+11. עוצמת החשק המיני הטבעי (ללא גירוי חיצוני)?
+12. רמת ההתלהבות היומית — יש "ניצוץ"?
+
+*😴 שינה והתאוששות*
+13. איכות השינה — שינה עמוקה ורציפה?
+14. שינה בחושך מוחלט, ללא מסכים?
+15. הטלפון מרוחק ממך בשינה?
+
+*🌿 סביבה וחשיפה לרעלים*
+16. הימנעות מכלי פלסטיק (מיקרוגל, בקבוקים, קופסאות)?
+17. הימנעות מדאודורנטים ובשמים מסחריים?
+18. הימנעות מבגדים סינתטיים (פוליאסטר, ניילון)?
+
+*🥗 תזונה והרגלים*
+19. צריכת חלבון איכותי בכל ארוחה?
+20. הימנעות ממזון מעובד, סוכר ושמנים תעשייתיים?
+21. עקביות בביצוע הרגלים שהחלטת עליהם?
+
+━━━━━━━━━━━━━━━
+📊 *טווחי ניקוד (מקסימום 105):*
+🔴 21–42 — חוסר איזון הורמונלי משמעותי. המערכת האנדוקרינית דורשת התערבות מיידית.
+🟠 43–63 — תת-אופטימלי. ישנם גורמי סטרס ביולוגי שמעכבים את הפוטנציאל.
+🟡 64–84 — בסיס סביר עם פוטנציאל לשיפור ניכר. כמה שינויים יעשו הבדל גדול.
+🟢 85–105 — מצב הורמונלי אופטימלי. המשך לחזק ולשמור.
+
+שלח את הניקוד הכולל ואבנה לך פרוטוקול מותאם אישית 🎯`
+          : `🧬 *Scientific Hormonal Assessment — 21 Parameters*
+
+*Scale: 1–5 per question*
+1 = Almost never | 3 = Sometimes | 5 = Always / consistently
+
+*🔋 Energy & Internal Drive*
+1. Your energy intensity immediately upon waking?
+2. Level of internal motivation to act throughout the day?
+3. Energy stability — no afternoon crashes?
+4. General vitality and dynamism?
+
+*⚡ Physical Performance*
+5. Weekly training frequency?
+6. Training intensity (% of your maximum)?
+7. Recovery capacity after training or a demanding period?
+8. Muscular strength and endurance vs. last year?
+
+*🧠 Cognitive & Hormonal Function*
+9. Mental clarity, focus and memory sharpness?
+10. Confidence in decision-making — without excessive doubt?
+11. Natural libido intensity (without external stimulation)?
+12. Daily enthusiasm — is there a "spark"?
+
+*😴 Sleep & Recovery*
+13. Sleep quality — deep and uninterrupted?
+14. Sleeping in complete darkness, no screens?
+15. Phone kept away from you during sleep?
+
+*🌿 Environment & Toxin Exposure*
+16. Avoiding plastic containers (microwave, bottles, boxes)?
+17. Avoiding commercial deodorants and synthetic fragrances?
+18. Avoiding synthetic clothing (polyester, nylon)?
+
+*🥗 Nutrition & Habits*
+19. Quality protein at every meal?
+20. Avoiding processed food, sugar and industrial oils?
+21. Consistency in executing habits you've committed to?
+
+━━━━━━━━━━━━━━━
+📊 *Score ranges (max 105):*
+🔴 21–42 — Significant hormonal imbalance. The endocrine system requires immediate intervention.
+🟠 43–63 — Sub-optimal. Biological stressors are suppressing your potential.
+🟡 64–84 — Reasonable baseline with significant improvement potential. A few changes will make a big difference.
+🟢 85–105 — Optimal hormonal status. Continue to strengthen and maintain.
+
+Send your total score and I'll build you a personalized protocol 🎯`;
 
       // ===== ניתוח ניקוד שאלון =====
-      } else if (user.history.slice(-3).some(h => h.content.includes('שאלון') || h.content.includes('questionnaire') || h.content.includes('21 שאלות') || h.content.includes('21-Question')) && /^\d+$/.test(msg.trim()) && parseInt(msg.trim()) >= 21 && parseInt(msg.trim()) <= 63) {
+      } else if (user.history.slice(-4).some(h => h.content && (h.content.includes('שאלון') || h.content.includes('questionnaire') || h.content.includes('21 פרמטרים') || h.content.includes('21 Parameters'))) && /^\d+$/.test(msg.trim()) && parseInt(msg.trim()) >= 21 && parseInt(msg.trim()) <= 105) {
         const score = parseInt(msg.trim());
-        reply = await callClaude([{ role: 'user', content: `Max v4. User completed 21-question hormonal assessment. Score: ${score}/63. Age: ${user.profile?.age || '?'}.
-Analyze: what this score means, top 3 most impactful things to fix based on hormonal science, RAHIT protocol recommendation, key supplements to start with (from: Magnesium, Zinc+Copper, D3+K2, Boron cycling, Tongkat Ali, Ashwagandha KSM-66). Be specific and encouraging. Respond in: ${lang}` }], null, 600);
+        const scoreCategory = score <= 42 ? 'critical' : score <= 63 ? 'suboptimal' : score <= 84 ? 'moderate' : 'optimal';
+        if (!user.personalPlan) user.personalPlan = { supplements: [], protocols: [], goals: [], restrictions: [], lastUpdated: null, hormonalScore: null, hormonalScoreDate: null };
+        user.personalPlan.hormonalScore = score;
+        user.personalPlan.hormonalScoreDate = new Date().toLocaleDateString();
+        reply = await callClaude([{ role: 'user', content: `Max v4. User completed scientific 21-parameter hormonal assessment.
+Score: ${score}/105 — Category: ${scoreCategory}
+${buildUserContext(user)}
+
+Provide a detailed, science-based analysis:
+📊 *Score Analysis:* What this score means biologically (HPA axis, Leydig cells, cortisol/testosterone ratio)
+🔍 *Key Deficiencies Identified:* Top 3 areas dragging the score down
+🎯 *Personalized Action Plan:*
+  Priority 1 (this week): [most impactful single change]
+  Priority 2 (this month): [protocol to implement]
+  Priority 3 (ongoing): [long-term habit]
+💊 *Recommended Supplement Stack* (from approved list only — Magnesium, Zinc+Copper, D3+K2, Boron cycling, Tongkat Ali, Ashwagandha KSM-66, Omega-3, Creatine, B6 P5P)
+🏋️ *RAHIT Protocol recommendation* based on score
+⚕️ Medical disclaimer
+Respond in: ${lang}` }], null, 900);
 
       // ===== ביוהאקרים מפורסמים =====
       } else if (['huberman', 'attia', 'sinclair', 'johnson', 'rhonda', 'patrick', 'greenfield', 'wim hof'].some(n => msgLower.includes(n))) {
@@ -1222,12 +1531,18 @@ Analyze: what this score means, top 3 most impactful things to fix based on horm
 
 // =================== HELPERS ===================
 function buildStatusContext(user, lang, summaryText) {
+  const plan = user.personalPlan || {};
   return `\n\n${summaryText ? summaryText + '\n\n' : ''}📊 Status:
 Name: ${user.profile?.name || '?'} | Age: ${user.profile?.age || '?'} | Streak: ${user.streak} days
 Height: ${user.profile?.height || '?'} | Weight: ${user.profile?.weight || '?'} | BMI: ${user.profile?.bmi || '?'}
+Goals: ${user.profile?.goals?.join(', ') || 'not set'}
 Meals: ${user.todayMeals?.length || 0} | Steps: ${user.fitnessData?.todaySteps || 0} | Workout: ${user.fitnessData?.todayWorkoutMinutes || 0} min
-Conditions: ${user.medicalHistory?.conditions?.join(', ') || 'none'}
-Language: ${lang} — RESPOND IN THIS LANGUAGE ONLY`;
+Conditions: ${user.medicalHistory?.conditions?.join(', ') || 'none'} | Medications: ${user.medicalHistory?.medications?.join(', ') || 'none'}
+Personal Supplement Plan: ${plan.supplements?.length > 0 ? plan.supplements.join(', ') : 'not set yet'}
+Personal Protocols: ${plan.protocols?.length > 0 ? plan.protocols.join(', ') : 'not set yet'}
+Hormonal Score: ${plan.hormonalScore ? plan.hormonalScore + '/105' : 'not assessed'}
+Language: ${lang} — RESPOND IN THIS LANGUAGE ONLY
+IMPORTANT: When user asks to ADD supplements, take their CURRENT personal plan and add to it — do NOT start from scratch.`;
 }
 
 async function processAIReply(aiReply, user, originalMsg, lang) {
